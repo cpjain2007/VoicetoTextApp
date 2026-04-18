@@ -27,6 +27,7 @@ type TranscriptionResult = {
   text: string;
   detectedSpeakerName: string | null;
   speakerConfidence: number | null;
+  assemblySpeakerLabel: string | null;
 };
 
 type SpeakerProfile = {
@@ -41,6 +42,47 @@ type SpeakerCorrectionSuggestion = {
 };
 
 const HISTORY_STORAGE_KEY = "voicetotext.history.v1";
+
+const normalizeSpeakerKey = (value: string) => value.trim().toLowerCase();
+
+const resolveSpeakerNameConflict = (
+  manualName: string,
+  result: TranscriptionResult,
+  minConfidence: number,
+): Promise<string> => {
+  const manual = manualName.trim();
+  const detected = result.detectedSpeakerName?.trim() || "";
+  const confidence = result.speakerConfidence;
+  const hasConfidentMatch =
+    !!detected &&
+    typeof confidence === "number" &&
+    confidence >= minConfidence &&
+    normalizeSpeakerKey(manual) !== normalizeSpeakerKey(detected);
+
+  if (!hasConfidentMatch) {
+    return Promise.resolve(manual);
+  }
+
+  const pct = (confidence * 100).toFixed(0);
+  const diarization = result.assemblySpeakerLabel
+    ? `\n\nAssemblyAI diarization label: ${result.assemblySpeakerLabel}`
+    : "";
+
+  return new Promise((resolve) => {
+    const finish = (choice: string) => resolve(choice.trim());
+
+    Alert.alert(
+      "Check speaker name",
+      `You entered "${manual}". Voice fingerprint match suggests "${detected}" (${pct}% confidence).${diarization}\n\nWhich name should we use for this transcript?`,
+      [
+        { text: `Use "${detected}"`, onPress: () => finish(detected) },
+        { text: `Keep "${manual}"`, onPress: () => finish(manual) },
+        { text: "Cancel", style: "cancel", onPress: () => finish(manual) },
+      ],
+      { cancelable: true, onDismiss: () => finish(manual) },
+    );
+  });
+};
 
 export default function App() {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -161,11 +203,16 @@ export default function App() {
       transcript?: string;
       detectedSpeakerName?: string | null;
       speakerConfidence?: number | null;
+      assemblySpeakerLabel?: string | null;
     };
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",
       detectedSpeakerName: data.detectedSpeakerName?.trim() || null,
       speakerConfidence: typeof data.speakerConfidence === "number" ? data.speakerConfidence : null,
+      assemblySpeakerLabel:
+        typeof data.assemblySpeakerLabel === "string" && data.assemblySpeakerLabel.trim()
+          ? data.assemblySpeakerLabel.trim()
+          : null,
     } satisfies TranscriptionResult;
   };
 
@@ -367,10 +414,24 @@ export default function App() {
           !!result.detectedSpeakerName &&
           result.speakerConfidence !== null &&
           result.speakerConfidence >= speakerAutoAssignMinConfidence;
-        const normalizedSpeakerName =
+
+        let normalizedSpeakerName =
           manualSpeakerName ||
           (hasConfidentDetectedSpeaker ? result.detectedSpeakerName : null) ||
           "Unknown speaker";
+
+        if (manualSpeakerName && hasConfidentDetectedSpeaker && result.detectedSpeakerName) {
+          const confirmed = await resolveSpeakerNameConflict(
+            manualSpeakerName,
+            result,
+            speakerAutoAssignMinConfidence,
+          );
+          normalizedSpeakerName = confirmed || normalizedSpeakerName;
+          if (normalizeSpeakerKey(confirmed) !== normalizeSpeakerKey(manualSpeakerName)) {
+            setSpeakerName(confirmed);
+          }
+        }
+
         setTranscript(text);
         setLastSpeakerName(normalizedSpeakerName);
         const createdAtMs = Date.now();

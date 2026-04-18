@@ -6,10 +6,19 @@
     "firebase": "firebase",
     "firebase:login": "firebase login",
     "firebase:projects": "firebase projects:list",
-    "firebase:deploy": "firebase deploy --only \"functions,firestore:rules\"",
-    "firebase:use": "firebase use"
+    "firebase:deploy": "cross-env FUNCTIONS_DISCOVERY_TIMEOUT=60 firebase deploy --only \"functions,firestore:rules\"",
+    "firebase:use": "firebase use",
+    "app:eas:link": "npm run eas:link --prefix VoiceToTextApp",
+    "app:eas:build": "npm run eas:build:production --prefix VoiceToTextApp",
+    "app:eas:build:preview": "npm run eas:build:preview --prefix VoiceToTextApp",
+    "app:eas:update": "npm run eas:update:production --prefix VoiceToTextApp",
+    "app:eas:update:configure": "npm run eas:update:configure --prefix VoiceToTextApp",
+    "app:eas:release:android": "npm run release:android --prefix VoiceToTextApp",
+    "app:eas:release:ios": "npm run release:ios --prefix VoiceToTextApp",
+    "app:eas:release:ota": "npm run release:ota --prefix VoiceToTextApp"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "firebase-tools": "^14.0.0"
   }
 }

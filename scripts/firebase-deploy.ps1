@@ -21,6 +21,7 @@ if (-not $ProjectId) {
 
 Set-Location $root
 Write-Host "Using project: $ProjectId" -ForegroundColor Cyan
+$env:FUNCTIONS_DISCOVERY_TIMEOUT = "60"
 npx firebase use $ProjectId
 node (Join-Path $root "scripts\sync-functions-env.js") $ProjectId
 npx firebase deploy --only "functions,firestore:rules"

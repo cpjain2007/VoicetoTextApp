@@ -3,7 +3,6 @@ const cors = require("cors");
 const multer = require("multer");
 const OpenAI = require("openai");
 const { AssemblyAI } = require("assemblyai");
-const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs/promises");
 const path = require("path");
 const os = require("os");
@@ -337,8 +336,17 @@ const buildVoiceSignature = (pcmBuffer) => {
   ];
 };
 
+let cachedFfmpegPath;
+const getFfmpegPath = () => {
+  if (cachedFfmpegPath === undefined) {
+    cachedFfmpegPath = require("ffmpeg-static") || null;
+  }
+  return cachedFfmpegPath;
+};
+
 const convertAudioToPcm = async (inputBuffer, fileExtension) => {
-  if (!ffmpegPath) {
+  const ffmpegBin = getFfmpegPath();
+  if (!ffmpegBin) {
     throw new Error("ffmpeg-static is not available.");
   }
 
@@ -347,7 +355,7 @@ const convertAudioToPcm = async (inputBuffer, fileExtension) => {
 
   try {
     const pcmBuffer = await new Promise((resolve, reject) => {
-      const ffmpeg = spawn(ffmpegPath, [
+      const ffmpeg = spawn(ffmpegBin, [
         "-i",
         tempInputPath,
         "-f",

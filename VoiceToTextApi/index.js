@@ -3,14 +3,21 @@
  * Public URL ends with function name `api`; append paths like /health, /transcribe.
  * invoker "public" is required for Expo; protect routes with SERVER_BEARER_TOKEN in app.js.
  * minInstances: 1 reduces cold starts (adds baseline cost on Blaze).
+ *
+ * Heavy deps (firebase-admin, ./app) load inside onInit() so deploy-time discovery does not
+ * execute them — avoids "Cannot determine backend specification. Timeout after 10000".
  */
-const admin = require("firebase-admin");
+const { onInit } = require("firebase-functions/v2/core");
 const { onRequest } = require("firebase-functions/v2/https");
 
-admin.initializeApp();
-process.env.SPEAKER_STORE_BACKEND = "firestore";
+let expressApp;
 
-const app = require("./app");
+onInit(() => {
+  const admin = require("firebase-admin");
+  admin.initializeApp();
+  process.env.SPEAKER_STORE_BACKEND = "firestore";
+  expressApp = require("./app");
+});
 
 exports.api = onRequest(
   {
@@ -21,5 +28,5 @@ exports.api = onRequest(
     minInstances: 1,
     invoker: "public",
   },
-  app,
+  (req, res) => expressApp(req, res),
 );
