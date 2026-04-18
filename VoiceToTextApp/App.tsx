@@ -204,6 +204,8 @@ export default function App() {
       detectedSpeakerName?: string | null;
       speakerConfidence?: number | null;
       assemblySpeakerLabel?: string | null;
+      speakerIdentificationCandidates?: string[];
+      speakerIdentificationMapping?: Record<string, unknown> | null;
     };
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",

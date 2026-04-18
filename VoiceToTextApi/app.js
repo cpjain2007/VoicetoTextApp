@@ -9,6 +9,7 @@ const os = require("os");
 const { randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const speakerStore = require("./speakerStore");
+const voiceRecognition = require("./voiceRecognition");
 
 const app = express();
 const serverToken = process.env.SERVER_BEARER_TOKEN;
@@ -24,6 +25,16 @@ const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,
 const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.965");
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
+const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
+  .trim()
+  .toLowerCase();
+const speakerIdentificationEnabled =
+  assemblySpeakerIdentificationEnv !== "false" && assemblySpeakerIdentificationEnv !== "0";
+const assemblyKnownSpeakersMax = Math.min(
+  Math.max(Number(process.env.ASSEMBLYAI_SPEAKER_ID_MAX_NAMES || "20") || 20, 1),
+  50,
+);
+const assemblySpeakerNameMaxLen = 35;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -266,76 +277,6 @@ const buildSpeakerCorrectionSuggestion = async (latestText, recentHistory) => {
   };
 };
 
-const dotProduct = (a, b) => a.reduce((sum, item, index) => sum + item * (b[index] || 0), 0);
-
-const vectorMagnitude = (vector) => Math.sqrt(dotProduct(vector, vector));
-
-const cosineSimilarity = (a, b) => {
-  const denominator = vectorMagnitude(a) * vectorMagnitude(b);
-  if (!denominator) {
-    return 0;
-  }
-  return dotProduct(a, b) / denominator;
-};
-
-const parseInt16LE = (buffer, offset) => buffer.readInt16LE(offset) / 32768;
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-
-const buildVoiceSignature = (pcmBuffer) => {
-  const totalSamples = Math.floor(pcmBuffer.length / 2);
-  if (totalSamples < 4000) {
-    throw new Error("Audio clip is too short for speaker recognition.");
-  }
-
-  let sumAbs = 0;
-  let sumSquares = 0;
-  let zeroCrossings = 0;
-  let previousSample = 0;
-  const frameSize = 320;
-  const energyFrames = [];
-  let frameEnergy = 0;
-  let frameSamples = 0;
-
-  for (let i = 0; i < totalSamples; i += 1) {
-    const sample = parseInt16LE(pcmBuffer, i * 2);
-    const absSample = Math.abs(sample);
-    sumAbs += absSample;
-    sumSquares += sample * sample;
-    if ((sample >= 0 && previousSample < 0) || (sample < 0 && previousSample >= 0)) {
-      zeroCrossings += 1;
-    }
-    previousSample = sample;
-    frameEnergy += sample * sample;
-    frameSamples += 1;
-    if (frameSamples >= frameSize) {
-      energyFrames.push(frameEnergy / frameSamples);
-      frameEnergy = 0;
-      frameSamples = 0;
-    }
-  }
-
-  if (frameSamples > 0) {
-    energyFrames.push(frameEnergy / frameSamples);
-  }
-
-  const meanAbs = sumAbs / totalSamples;
-  const rms = Math.sqrt(sumSquares / totalSamples);
-  const zcr = zeroCrossings / totalSamples;
-  const meanEnergy = energyFrames.reduce((sum, item) => sum + item, 0) / energyFrames.length;
-  const energyVariance =
-    energyFrames.reduce((sum, item) => sum + (item - meanEnergy) ** 2, 0) / energyFrames.length;
-  const dynamicRange = clamp(Math.sqrt(energyVariance) / (meanEnergy + 1e-7), 0, 10);
-
-  return [
-    clamp(meanAbs, 0, 1),
-    clamp(rms, 0, 1),
-    clamp(zcr, 0, 1),
-    clamp(meanEnergy, 0, 1),
-    clamp(dynamicRange / 10, 0, 1),
-  ];
-};
-
 let cachedFfmpegPath;
 const getFfmpegPath = () => {
   if (cachedFfmpegPath === undefined) {
@@ -439,7 +380,7 @@ const detectSpeakerName = async (signature) => {
     if (!Array.isArray(profile.vector) || profile.vector.length !== signature.length) {
       continue;
     }
-    const score = cosineSimilarity(signature, profile.vector);
+    const score = voiceRecognition.cosineSimilarity(signature, profile.vector);
     if (!best || score > best.score) {
       best = { name: profile.name, score };
     }
@@ -502,7 +443,7 @@ const executeTranscription = async (req, res, fileLike) => {
 
     const extension = extensionFromMime(fileLike.mimetype);
     const pcmBuffer = await convertAudioToPcm(fileLike.buffer, extension);
-    const voiceSignature = buildVoiceSignature(pcmBuffer);
+    const voiceSignature = voiceRecognition.buildVoiceSignature(pcmBuffer);
     const speakerNameHeader =
       typeof req.headers["x-speaker-name"] === "string" ? req.headers["x-speaker-name"].trim() : "";
     const speakerNameQuery =
@@ -514,6 +455,17 @@ const executeTranscription = async (req, res, fileLike) => {
       await updateSpeakerProfile(manualSpeakerName, voiceSignature);
     }
     const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
+
+    const profilesForIdentification = await speakerStore.readSpeakerProfiles();
+    const knownSpeakerValues = voiceRecognition.buildKnownSpeakerValuesForIdentification(
+      profilesForIdentification,
+      manualSpeakerName,
+      { maxNames: assemblyKnownSpeakersMax, nameMaxLen: assemblySpeakerNameMaxLen },
+    );
+    const speechUnderstandingBlock = voiceRecognition.buildSpeechUnderstandingSpeakerIdentification(
+      knownSpeakerValues,
+      speakerIdentificationEnabled,
+    );
 
     const baseTranscriptOptions = {
       audio: fileLike.buffer,
@@ -527,10 +479,16 @@ const executeTranscription = async (req, res, fileLike) => {
 
     for (const model of modelsToTry) {
       try {
-        const candidate = await transcribeWithRetry(assemblyClient, {
-          ...baseTranscriptOptions,
-          speech_models: [model],
-        });
+        const candidate = await transcribeWithRetry(
+          assemblyClient,
+          voiceRecognition.mergeAssemblyTranscriptPayload(
+            {
+              ...baseTranscriptOptions,
+              speech_models: [model],
+            },
+            speechUnderstandingBlock,
+          ),
+        );
         if (candidate && candidate.status === "error") {
           lastModelError = new Error(candidate.error || `AssemblyAI rejected model ${model}.`);
           continue;
@@ -544,23 +502,32 @@ const executeTranscription = async (req, res, fileLike) => {
     }
 
     if (!transcript && lastModelError) {
-      const multilingualFallbackOptions = {
-        audio: fileLike.buffer,
-        speaker_labels: true,
-        ...(forcedLanguageCode ? { language_code: forcedLanguageCode } : { language_detection: true }),
-        speech_models: ["best"],
-      };
+      const multilingualFallbackOptions = voiceRecognition.mergeAssemblyTranscriptPayload(
+        {
+          audio: fileLike.buffer,
+          speaker_labels: true,
+          ...(forcedLanguageCode ? { language_code: forcedLanguageCode } : { language_detection: true }),
+          speech_models: ["best"],
+        },
+        speechUnderstandingBlock,
+      );
       const fallbackTranscript = await transcribeWithRetry(assemblyClient, multilingualFallbackOptions);
       if (!fallbackTranscript || fallbackTranscript.status === "error") {
         let languageSpecificTranscript = null;
         let languageSpecificError = null;
         for (const languageCode of languageFallbackCodes) {
-          const candidate = await transcribeWithRetry(assemblyClient, {
-            audio: fileLike.buffer,
-            speaker_labels: true,
-            language_code: languageCode,
-            speech_models: ["best"],
-          });
+          const candidate = await transcribeWithRetry(
+            assemblyClient,
+            voiceRecognition.mergeAssemblyTranscriptPayload(
+              {
+                audio: fileLike.buffer,
+                speaker_labels: true,
+                language_code: languageCode,
+                speech_models: ["best"],
+              },
+              speechUnderstandingBlock,
+            ),
+          );
           if (candidate && candidate.status !== "error") {
             languageSpecificTranscript = candidate;
             languageSpecificError = null;
@@ -589,8 +556,8 @@ const executeTranscription = async (req, res, fileLike) => {
 
     const transcriptText = transcript.text || "";
     const utterances = Array.isArray(transcript.utterances) ? transcript.utterances : [];
-    const dominantAssemblySpeakerLabel =
-      utterances.length > 0 && utterances[0].speaker ? `Speaker ${utterances[0].speaker}` : null;
+    const dominantAssemblySpeakerLabel = voiceRecognition.formatDominantAssemblySpeakerLabel(utterances);
+    const speakerIdentificationMapping = voiceRecognition.pickSpeakerIdentificationMapping(transcript);
     const aiInsights = await buildAiInsights(transcriptText).catch(() => null);
 
     return res.json({
@@ -598,6 +565,8 @@ const executeTranscription = async (req, res, fileLike) => {
       detectedSpeakerName: detectedSpeaker?.name || null,
       speakerConfidence: detectedSpeaker?.score ?? null,
       assemblySpeakerLabel: dominantAssemblySpeakerLabel,
+      speakerIdentificationCandidates: knownSpeakerValues,
+      speakerIdentificationMapping,
       utterances: utterances.map((item) => ({
         speaker: item.speaker || null,
         text: item.text || "",
