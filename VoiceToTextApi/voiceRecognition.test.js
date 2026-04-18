@@ -7,9 +7,12 @@
  *    "too short for speaker recognition" before AssemblyAI is called (if PCM path runs).
  * 2. Enrollment: POST with speakerName + valid clip updates /speakers (samples increment).
  * 3. Match: second clip without speakerName should return detectedSpeakerName when similarity
- *    clears SPEAKER_MATCH_THRESHOLD (same person, similar recording conditions).
+ *    clears SPEAKER_MATCH_THRESHOLD (same person, similar recording conditions). Old 5-D
+ *    profiles are padded and blended on next enroll; re-enroll once if matches feel off.
  * 4. AssemblyAI Speaker ID: multi-speaker file + several enrolled names in speaker-profiles
  *    should return utterances[].speaker as names and speakerIdentificationMapping when enabled.
+ * 5. Optional per-profile `speakerDescription` (or `description`) in stored JSON improves AssemblyAI
+ *    `speakers[].description` hints (no app UI yet — edit speaker-profiles.json or Firestore doc).
  *
  * Automated tests below cover pure voice-recognition helpers (no network, no ffmpeg).
  */
@@ -54,10 +57,10 @@ describe("buildVoiceSignature", () => {
     assert.throws(() => voiceRecognition.buildVoiceSignature(short), /too short/i);
   });
 
-  it("returns a 5-dimensional normalized vector for valid PCM", () => {
+  it("returns a VOICE_SIGNATURE_LENGTH normalized vector for valid PCM", () => {
     const pcm = makePcmSine(voiceRecognition.MIN_SIGNATURE_SAMPLES + 800);
     const sig = voiceRecognition.buildVoiceSignature(pcm);
-    assert.equal(sig.length, 5);
+    assert.equal(sig.length, voiceRecognition.VOICE_SIGNATURE_LENGTH);
     for (const x of sig) {
       assert.ok(x >= 0 && x <= 1, `expected clamped [0,1], got ${x}`);
     }
@@ -76,7 +79,106 @@ describe("buildVoiceSignature", () => {
     const sLow = voiceRecognition.buildVoiceSignature(low);
     const sHigh = voiceRecognition.buildVoiceSignature(high);
     const sim = voiceRecognition.cosineSimilarity(sLow, sHigh);
-    assert.ok(sim < 0.999, `expected different tones to diverge, similarity was ${sim}`);
+    assert.ok(sim < 0.995, `expected different tones to diverge, similarity was ${sim}`);
+  });
+});
+
+describe("padVoiceVector", () => {
+  it("pads short legacy vectors with fill for comparison", () => {
+    const legacy = [0.1, 0.2, 0.3, 0.4, 0.5];
+    const padded = voiceRecognition.padVoiceVector(legacy, 12, 0.5);
+    assert.equal(padded.length, 12);
+    assert.deepEqual(padded.slice(0, 5), legacy);
+    assert.ok(padded.slice(5).every((x) => x === 0.5));
+  });
+
+  it("truncates when stored vector is longer than query", () => {
+    const long = Array.from({ length: 20 }, (_, i) => i / 20);
+    const cut = voiceRecognition.padVoiceVector(long, 12, 0.5);
+    assert.equal(cut.length, 12);
+    assert.deepEqual(cut, long.slice(0, 12));
+  });
+});
+
+describe("prioritizeSpeakerNameInKnownList", () => {
+  it("moves manual name to the front when it appears later in the list", () => {
+    const ordered = voiceRecognition.prioritizeSpeakerNameInKnownList(["Alice", "Bob", "Charlie"], "Charlie");
+    assert.deepEqual(ordered, ["Charlie", "Alice", "Bob"]);
+  });
+
+  it("leaves list unchanged when manual name is missing or already first", () => {
+    assert.deepEqual(voiceRecognition.prioritizeSpeakerNameInKnownList(["Alice", "Bob"], "Zed"), ["Alice", "Bob"]);
+    assert.deepEqual(voiceRecognition.prioritizeSpeakerNameInKnownList(["Alice", "Bob"], "Alice"), [
+      "Alice",
+      "Bob",
+    ]);
+    assert.deepEqual(voiceRecognition.prioritizeSpeakerNameInKnownList(["Bob"], ""), ["Bob"]);
+  });
+});
+
+describe("profilesToAssemblySpeakers", () => {
+  it("builds name + description objects with custom speakerDescription", () => {
+    const speakers = voiceRecognition.profilesToAssemblySpeakers(
+      [{ name: "Alice", speakerDescription: "Project lead" }, { name: "Bob" }],
+      null,
+      { maxNames: 10, nameMaxLen: 35, descriptionMaxLen: 80 },
+    );
+    assert.equal(speakers.length, 2);
+    assert.equal(speakers[0].name, "Alice");
+    assert.equal(speakers[0].description, "Project lead");
+    assert.equal(speakers[1].name, "Bob");
+    assert.ok(speakers[1].description.includes("Voice-to-Text"));
+  });
+
+  it("includes manual-only enrollments with default description", () => {
+    const speakers = voiceRecognition.profilesToAssemblySpeakers([], "Zed", { maxNames: 5 });
+    assert.deepEqual(speakers.map((s) => s.name), ["Zed"]);
+    assert.ok(speakers[0].description.length > 10);
+  });
+});
+
+describe("prioritizeManualSpeakerFirstSpeakers", () => {
+  it("moves manual speaker entry to the front", () => {
+    const ordered = voiceRecognition.prioritizeManualSpeakerFirstSpeakers(
+      [
+        { name: "Alice", description: "a" },
+        { name: "Bob", description: "b" },
+      ],
+      "Bob",
+    );
+    assert.equal(ordered[0].name, "Bob");
+    assert.equal(ordered[1].name, "Alice");
+  });
+});
+
+describe("buildSpeechUnderstandingSpeakerIdentificationFromSpeakers", () => {
+  it("uses speakers array instead of known_values", () => {
+    const block = voiceRecognition.buildSpeechUnderstandingSpeakerIdentificationFromSpeakers(
+      [
+        { name: "Ann", description: "QA" },
+        { name: "Ben", description: "Dev" },
+      ],
+      true,
+    );
+    assert.ok(block.request.speaker_identification.speakers);
+    assert.equal(block.request.speaker_identification.speakers.length, 2);
+    assert.equal(block.request.speaker_identification.speakers[0].name, "Ann");
+    assert.ok(!("known_values" in block.request.speaker_identification));
+  });
+});
+
+describe("bestCosineScoreAgainstProfile", () => {
+  it("returns max similarity across aggregate and recent vectors", () => {
+    const sig = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const profile = {
+      vector: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      vectorsRecent: [[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+    };
+    assert.equal(voiceRecognition.bestCosineScoreAgainstProfile(sig, profile), 1);
+  });
+
+  it("returns null when profile has no usable vectors", () => {
+    assert.equal(voiceRecognition.bestCosineScoreAgainstProfile([0.5, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], {}), null);
   });
 });
 

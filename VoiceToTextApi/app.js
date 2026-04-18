@@ -35,6 +35,14 @@ const assemblyKnownSpeakersMax = Math.min(
   50,
 );
 const assemblySpeakerNameMaxLen = 35;
+const assemblySpeakerDescriptionMaxLen = Math.min(
+  Math.max(Number(process.env.ASSEMBLYAI_SPEAKER_DESCRIPTION_MAX || "220") || 220, 40),
+  500,
+);
+const speakerRecentVectorsMax = Math.min(
+  Math.max(Number(process.env.SPEAKER_RECENT_VECTORS_MAX || "5") || 5, 1),
+  12,
+);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -354,18 +362,32 @@ const extensionFromMime = (mimeType) => {
 
 const updateSpeakerProfile = async (speakerName, signature) => {
   const profiles = await speakerStore.readSpeakerProfiles();
+  const sigCopy = [...signature];
   const existingIndex = profiles.findIndex((item) => item.name === speakerName);
   if (existingIndex >= 0) {
     const current = profiles[existingIndex];
     const total = (current.samples || 0) + 1;
-    const currentVector = Array.isArray(current.vector) ? current.vector : signature.map(() => 0);
+    const currentVector =
+      Array.isArray(current.vector) && current.vector.length > 0 ? current.vector : signature.map(() => 0);
+    const alignedCurrent = voiceRecognition.padVoiceVector(currentVector, signature.length, 0.5);
+    const prevRecent = Array.isArray(current.vectorsRecent)
+      ? current.vectorsRecent.filter((v) => Array.isArray(v) && v.length > 0).map((v) => [...v])
+      : [];
+    const nextRecent = [...prevRecent, sigCopy].slice(-speakerRecentVectorsMax);
     profiles[existingIndex] = {
+      ...current,
       name: speakerName,
       samples: total,
-      vector: currentVector.map((value, index) => (value * (total - 1) + signature[index]) / total),
+      vector: alignedCurrent.map((value, index) => (value * (total - 1) + signature[index]) / total),
+      vectorsRecent: nextRecent,
     };
   } else {
-    profiles.push({ name: speakerName, samples: 1, vector: signature });
+    profiles.push({
+      name: speakerName,
+      samples: 1,
+      vector: signature,
+      vectorsRecent: [sigCopy],
+    });
   }
   await speakerStore.writeSpeakerProfiles(profiles);
 };
@@ -377,10 +399,10 @@ const detectSpeakerName = async (signature) => {
   }
   let best = null;
   for (const profile of profiles) {
-    if (!Array.isArray(profile.vector) || profile.vector.length !== signature.length) {
+    const score = voiceRecognition.bestCosineScoreAgainstProfile(signature, profile);
+    if (score == null) {
       continue;
     }
-    const score = voiceRecognition.cosineSimilarity(signature, profile.vector);
     if (!best || score > best.score) {
       best = { name: profile.name, score };
     }
@@ -399,13 +421,71 @@ app.get("/speakers", async (_req, res) => {
   try {
     const profiles = await speakerStore.readSpeakerProfiles();
     return res.json({
-      speakers: profiles.map((profile) => ({
-        name: profile.name,
-        samples: profile.samples || 0,
-      })),
+      speakers: profiles.map((profile) => {
+        const desc =
+          typeof profile.speakerDescription === "string"
+            ? profile.speakerDescription
+            : typeof profile.description === "string"
+              ? profile.description
+              : "";
+        return {
+          name: profile.name,
+          samples: profile.samples || 0,
+          ...(desc.trim() ? { description: desc.trim() } : {}),
+        };
+      }),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not load speaker profiles.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.patch("/speakers", async (req, res) => {
+  try {
+    const rawName = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    if (!rawName) {
+      return res.status(400).json({ error: "Missing name in JSON body." });
+    }
+    const rawDesc =
+      typeof req.body?.speakerDescription === "string" ? req.body.speakerDescription : "";
+    const speakerDescription = String(rawDesc).trim().slice(0, assemblySpeakerDescriptionMaxLen);
+
+    const profiles = await speakerStore.readSpeakerProfiles();
+    const key = rawName.toLowerCase();
+    const idx = profiles.findIndex((item) => String(item.name || "").trim().toLowerCase() === key);
+    if (idx < 0) {
+      return res.status(404).json({ error: "Speaker not found." });
+    }
+
+    const current = profiles[idx];
+    const next = { ...current };
+    if (speakerDescription) {
+      next.speakerDescription = speakerDescription;
+      delete next.description;
+    } else {
+      delete next.speakerDescription;
+      delete next.description;
+    }
+    profiles[idx] = next;
+    await speakerStore.writeSpeakerProfiles(profiles);
+
+    const descOut =
+      typeof next.speakerDescription === "string"
+        ? next.speakerDescription
+        : typeof next.description === "string"
+          ? next.description
+          : "";
+    return res.json({
+      ok: true,
+      speaker: {
+        name: next.name,
+        samples: next.samples || 0,
+        ...(descOut.trim() ? { description: descOut.trim() } : {}),
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not update speaker profile.";
     return res.status(500).json({ error: message });
   }
 });
@@ -457,15 +537,31 @@ const executeTranscription = async (req, res, fileLike) => {
     const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
 
     const profilesForIdentification = await speakerStore.readSpeakerProfiles();
-    const knownSpeakerValues = voiceRecognition.buildKnownSpeakerValuesForIdentification(
-      profilesForIdentification,
+    const knownSpeakerValues = voiceRecognition.prioritizeSpeakerNameInKnownList(
+      voiceRecognition.buildKnownSpeakerValuesForIdentification(
+        profilesForIdentification,
+        manualSpeakerName,
+        { maxNames: assemblyKnownSpeakersMax, nameMaxLen: assemblySpeakerNameMaxLen },
+      ),
       manualSpeakerName,
-      { maxNames: assemblyKnownSpeakersMax, nameMaxLen: assemblySpeakerNameMaxLen },
     );
-    const speechUnderstandingBlock = voiceRecognition.buildSpeechUnderstandingSpeakerIdentification(
-      knownSpeakerValues,
-      speakerIdentificationEnabled,
+    const assemblySpeakers = voiceRecognition.prioritizeManualSpeakerFirstSpeakers(
+      voiceRecognition.profilesToAssemblySpeakers(profilesForIdentification, manualSpeakerName, {
+        maxNames: assemblyKnownSpeakersMax,
+        nameMaxLen: assemblySpeakerNameMaxLen,
+        descriptionMaxLen: assemblySpeakerDescriptionMaxLen,
+      }),
+      manualSpeakerName,
     );
+    const speechUnderstandingBlock =
+      voiceRecognition.buildSpeechUnderstandingSpeakerIdentificationFromSpeakers(
+        assemblySpeakers,
+        speakerIdentificationEnabled,
+      ) ||
+      voiceRecognition.buildSpeechUnderstandingSpeakerIdentification(
+        knownSpeakerValues,
+        speakerIdentificationEnabled,
+      );
 
     const baseTranscriptOptions = {
       audio: fileLike.buffer,
@@ -560,12 +656,15 @@ const executeTranscription = async (req, res, fileLike) => {
     const speakerIdentificationMapping = voiceRecognition.pickSpeakerIdentificationMapping(transcript);
     const aiInsights = await buildAiInsights(transcriptText).catch(() => null);
 
+    const speakerIdentificationCandidates =
+      assemblySpeakers.length > 0 ? assemblySpeakers.map((s) => s.name) : knownSpeakerValues;
+
     return res.json({
       text: transcriptText,
       detectedSpeakerName: detectedSpeaker?.name || null,
       speakerConfidence: detectedSpeaker?.score ?? null,
       assemblySpeakerLabel: dominantAssemblySpeakerLabel,
-      speakerIdentificationCandidates: knownSpeakerValues,
+      speakerIdentificationCandidates,
       speakerIdentificationMapping,
       utterances: utterances.map((item) => ({
         speaker: item.speaker || null,

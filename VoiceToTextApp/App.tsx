@@ -4,7 +4,9 @@ import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
 import {
+  ActivityIndicator,
   Alert,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -33,6 +35,8 @@ type TranscriptionResult = {
 type SpeakerProfile = {
   name: string;
   samples: number;
+  /** Optional hint for AssemblyAI Speaker Identification (`speakerDescription` in API store). */
+  description?: string;
 };
 
 type SpeakerCorrectionSuggestion = {
@@ -42,6 +46,9 @@ type SpeakerCorrectionSuggestion = {
 };
 
 const HISTORY_STORAGE_KEY = "voicetotext.history.v1";
+
+/** Matches default `ASSEMBLYAI_SPEAKER_DESCRIPTION_MAX` on the API. */
+const SPEAKER_DESCRIPTION_MAX_CHARS = 220;
 
 const normalizeSpeakerKey = (value: string) => value.trim().toLowerCase();
 
@@ -96,6 +103,8 @@ export default function App() {
   const [isEnrollMode, setIsEnrollMode] = useState(false);
   const [speakers, setSpeakers] = useState<SpeakerProfile[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
+  const [speakerHintModal, setSpeakerHintModal] = useState<{ name: string; draft: string } | null>(null);
+  const [isSavingSpeakerHint, setIsSavingSpeakerHint] = useState(false);
   const [hasLoadedHistory, setHasLoadedHistory] = useState(false);
   const [statusText, setStatusText] = useState("Tap the mic and start speaking.");
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -237,6 +246,70 @@ export default function App() {
       }
     } finally {
       setIsLoadingSpeakers(false);
+    }
+  };
+
+  const openSpeakerHintModal = (speaker: SpeakerProfile) => {
+    setSpeakerHintModal({
+      name: speaker.name,
+      draft: speaker.description?.trim() ?? "",
+    });
+  };
+
+  const persistSpeakerHintToApi = async (name: string, speakerDescription: string) => {
+    const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+    const response = await fetch(`${getApiBaseUrl()}/speakers`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+      },
+      body: JSON.stringify({ name, speakerDescription }),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      throw new Error(bodyText || `Could not update hint (${response.status}).`);
+    }
+  };
+
+  const saveSpeakerHint = async () => {
+    if (!speakerHintModal) {
+      return;
+    }
+    const name = speakerHintModal.name;
+    const speakerDescription = speakerHintModal.draft.trim().slice(0, SPEAKER_DESCRIPTION_MAX_CHARS);
+    try {
+      setIsSavingSpeakerHint(true);
+      setErrorText(null);
+      await persistSpeakerHintToApi(name, speakerDescription);
+      setSpeakerHintModal(null);
+      setStatusText(speakerDescription ? `Saved hint for ${name}.` : `Cleared hint for ${name}.`);
+      await fetchSpeakers(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save speaker hint.";
+      setErrorText(message);
+    } finally {
+      setIsSavingSpeakerHint(false);
+    }
+  };
+
+  const clearSpeakerHint = async () => {
+    if (!speakerHintModal) {
+      return;
+    }
+    const name = speakerHintModal.name;
+    try {
+      setIsSavingSpeakerHint(true);
+      setErrorText(null);
+      await persistSpeakerHintToApi(name, "");
+      setSpeakerHintModal(null);
+      setStatusText(`Cleared hint for ${name}.`);
+      await fetchSpeakers(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not clear speaker hint.";
+      setErrorText(message);
+    } finally {
+      setIsSavingSpeakerHint(false);
     }
   };
 
@@ -505,6 +578,69 @@ export default function App() {
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar style="light" />
+      <Modal
+        visible={speakerHintModal !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => (isSavingSpeakerHint ? undefined : setSpeakerHintModal(null))}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={() => (isSavingSpeakerHint ? undefined : setSpeakerHintModal(null))}
+          />
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>AssemblyAI hint</Text>
+            <Text style={styles.modalSubtitle}>
+              {speakerHintModal ? `Optional context for “${speakerHintModal.name}” (voice ID).` : ""}
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="e.g. British accent, soft voice, usually discusses budgets…"
+              placeholderTextColor="#6b769e"
+              value={speakerHintModal?.draft ?? ""}
+              onChangeText={(text) =>
+                setSpeakerHintModal((current) =>
+                  current ? { ...current, draft: text.slice(0, SPEAKER_DESCRIPTION_MAX_CHARS) } : current,
+                )
+              }
+              multiline
+              editable={!isSavingSpeakerHint}
+              maxLength={SPEAKER_DESCRIPTION_MAX_CHARS}
+            />
+            <Text style={styles.modalCharCount}>
+              {(speakerHintModal?.draft.length ?? 0)}/{SPEAKER_DESCRIPTION_MAX_CHARS}
+            </Text>
+            <Pressable
+              style={styles.clearHintButton}
+              disabled={isSavingSpeakerHint}
+              onPress={() => void clearSpeakerHint()}
+            >
+              <Text style={styles.clearHintButtonText}>Clear hint</Text>
+            </Pressable>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                disabled={isSavingSpeakerHint}
+                onPress={() => setSpeakerHintModal(null)}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                disabled={isSavingSpeakerHint}
+                onPress={() => void saveSpeakerHint()}
+              >
+                {isSavingSpeakerHint ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.modalButtonPrimaryText}>Save</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <View style={styles.card}>
         <Text style={styles.kicker}>VOICE TO TEXT</Text>
         <Text style={styles.title}>Speak. Capture. Review.</Text>
@@ -624,15 +760,34 @@ export default function App() {
 
         <View style={styles.speakerListPanel}>
           <Text style={styles.panelTitle}>Known Speakers</Text>
+          <Text style={styles.speakerListHelp}>
+            Tap a speaker to add a short hint for AssemblyAI (accent, role, topics). Leave blank to clear.
+          </Text>
           {isLoadingSpeakers ? (
             <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
           ) : speakers.length === 0 ? (
             <Text style={styles.historyEmptyText}>No enrolled speakers yet.</Text>
           ) : (
             speakers.map((speaker) => (
-              <Text key={speaker.name} style={styles.speakerListItem}>
-                {speaker.name} ({speaker.samples} samples)
-              </Text>
+              <Pressable
+                key={speaker.name}
+                style={styles.speakerListRow}
+                onPress={() => openSpeakerHintModal(speaker)}
+              >
+                <View style={styles.speakerListRowMain}>
+                  <Text style={styles.speakerListName}>
+                    {speaker.name} ({speaker.samples} samples)
+                  </Text>
+                  {speaker.description ? (
+                    <Text style={styles.speakerListHint} numberOfLines={2}>
+                      {speaker.description}
+                    </Text>
+                  ) : (
+                    <Text style={styles.speakerListHintPlaceholder}>No hint — tap to add</Text>
+                  )}
+                </View>
+                <Text style={styles.speakerListEdit}>Edit</Text>
+              </Pressable>
             ))
           )}
         </View>
@@ -898,10 +1053,141 @@ const styles = StyleSheet.create({
     borderColor: "#202c55",
     paddingBottom: 12,
   },
-  speakerListItem: {
-    color: "#d7deff",
-    fontSize: 13,
+  speakerListHelp: {
+    color: "#8b98c9",
+    fontSize: 11,
+    lineHeight: 16,
     marginHorizontal: 14,
+    marginTop: 4,
+    marginBottom: 6,
+  },
+  speakerListRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginHorizontal: 10,
     marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#131c39",
+    borderWidth: 1,
+    borderColor: "#253264",
+    gap: 10,
+  },
+  speakerListRowMain: {
+    flex: 1,
+    minWidth: 0,
+  },
+  speakerListName: {
+    color: "#e8edff",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  speakerListHint: {
+    color: "#9aaad8",
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 17,
+  },
+  speakerListHintPlaceholder: {
+    color: "#6b769e",
+    fontSize: 12,
+    marginTop: 4,
+    fontStyle: "italic",
+  },
+  speakerListEdit: {
+    color: "#8ea1ff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  modalBackdrop: {
+    flex: 1,
+    justifyContent: "center",
+    paddingHorizontal: 20,
+    backgroundColor: "rgba(6, 8, 18, 0.72)",
+  },
+  modalCard: {
+    borderRadius: 18,
+    backgroundColor: "#1a2344",
+    borderWidth: 1,
+    borderColor: "#2c3b72",
+    padding: 18,
+    zIndex: 1,
+  },
+  modalTitle: {
+    color: "#f0f4ff",
+    fontSize: 17,
+    fontWeight: "700",
+  },
+  modalSubtitle: {
+    color: "#9aaad8",
+    fontSize: 12,
+    marginTop: 6,
+    lineHeight: 17,
+  },
+  modalInput: {
+    marginTop: 14,
+    minHeight: 100,
+    maxHeight: Platform.OS === "web" ? 180 : 140,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#3c4d8d",
+    backgroundColor: "#101834",
+    color: "#f0f4ff",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    textAlignVertical: "top",
+  },
+  modalCharCount: {
+    color: "#6b769e",
+    fontSize: 11,
+    marginTop: 6,
+    textAlign: "right",
+  },
+  clearHintButton: {
+    alignSelf: "flex-start",
+    marginTop: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+  },
+  clearHintButtonText: {
+    color: "#ff9bae",
+    fontSize: 13,
+    fontWeight: "600",
+    textDecorationLine: "underline",
+  },
+  modalActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 10,
+    marginTop: 16,
+  },
+  modalButton: {
+    borderRadius: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    minWidth: 96,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalButtonSecondary: {
+    borderWidth: 1,
+    borderColor: "#4e5fa9",
+    backgroundColor: "transparent",
+  },
+  modalButtonSecondaryText: {
+    color: "#c8d2ff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  modalButtonPrimary: {
+    backgroundColor: "#6a7cff",
+  },
+  modalButtonPrimaryText: {
+    color: "#ffffff",
+    fontSize: 14,
+    fontWeight: "700",
   },
 });
