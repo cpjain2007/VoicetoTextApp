@@ -2,8 +2,10 @@ import { StatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useState } from "react";
 import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
 import {
   Alert,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -101,41 +103,60 @@ export default function App() {
       throw new Error("Missing EXPO_PUBLIC_TRANSCRIBE_API_URL.");
     }
 
-    const formData = new FormData();
-    formData.append("file", {
-      uri,
-      name: "voice-note.m4a",
-      type: "audio/m4a",
-    } as any);
     const trimmedSpeakerName = currentSpeakerName.trim();
+    const baseUrl = apiUrl.replace(/\/transcribe\/?$/i, "");
 
-    const requestHeaders: Record<string, string> = {};
-    if (apiToken) {
-      requestHeaders.Authorization = `Bearer ${apiToken}`;
-    }
-    if (trimmedSpeakerName) {
-      requestHeaders["x-speaker-name"] = trimmedSpeakerName;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+      ...(trimmedSpeakerName ? { "x-speaker-name": trimmedSpeakerName } : {}),
+    };
+
+    let audioBase64: string;
+    if (Platform.OS === "web") {
+      const fileResponse = await fetch(uri);
+      if (!fileResponse.ok) {
+        throw new Error(`Could not read recording (${fileResponse.status}).`);
+      }
+      const blob = await fileResponse.blob();
+      audioBase64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const r = reader.result;
+          if (typeof r !== "string") {
+            reject(new Error("Could not read recording as base64."));
+            return;
+          }
+          const parts = r.split(",");
+          resolve(parts.length > 1 ? parts[1] : r);
+        };
+        reader.onerror = () => reject(reader.error || new Error("FileReader failed."));
+        reader.readAsDataURL(blob);
+      });
+    } else {
+      audioBase64 = await readAsStringAsync(uri, { encoding: EncodingType.Base64 });
     }
 
-    const requestUrl =
-      trimmedSpeakerName && apiUrl.includes("?")
-        ? `${apiUrl}&speakerName=${encodeURIComponent(trimmedSpeakerName)}`
-        : trimmedSpeakerName
-          ? `${apiUrl}?speakerName=${encodeURIComponent(trimmedSpeakerName)}`
-          : apiUrl;
+    const requestUrl = trimmedSpeakerName
+      ? `${baseUrl}/transcribe-base64?speakerName=${encodeURIComponent(trimmedSpeakerName)}`
+      : `${baseUrl}/transcribe-base64`;
 
     const response = await fetch(requestUrl, {
       method: "POST",
-      headers: Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined,
-      body: formData,
+      headers,
+      body: JSON.stringify({
+        audioBase64,
+        mimeType: "audio/m4a",
+        ...(trimmedSpeakerName ? { speakerName: trimmedSpeakerName } : {}),
+      }),
     });
 
+    const responseBody = await response.text();
     if (!response.ok) {
-      const details = await response.text();
-      throw new Error(details || `Transcription failed (${response.status}).`);
+      throw new Error(responseBody || `Transcription failed (${response.status}).`);
     }
 
-    const data = (await response.json()) as {
+    const data = JSON.parse(responseBody) as {
       text?: string;
       transcript?: string;
       detectedSpeakerName?: string | null;

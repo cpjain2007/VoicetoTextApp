@@ -1,0 +1,15 @@
+{
+  "name": "voicetotext-workspace",
+  "private": true,
+  "description": "Root scripts for Firebase deploy (API lives in VoiceToTextApi/)",
+  "scripts": {
+    "firebase": "firebase",
+    "firebase:login": "firebase login",
+    "firebase:projects": "firebase projects:list",
+    "firebase:deploy": "firebase deploy --only \"functions,firestore:rules\"",
+    "firebase:use": "firebase use"
+  },
+  "devDependencies": {
+    "firebase-tools": "^14.0.0"
+  }
+}
