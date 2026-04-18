@@ -22,7 +22,15 @@ const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
-const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.965");
+/** Higher = fewer wrong-speaker IDs; lower if the same person is often missed. */
+const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.97");
+const speakerMatchMargin = Number(process.env.SPEAKER_MATCH_MARGIN || "0.05");
+const speakerMatchRelaxedEnabled = ["true", "1", "yes"].includes(
+  (process.env.SPEAKER_MATCH_RELAXED_ENABLED || "").trim().toLowerCase(),
+);
+/** If the runner-up is still “strong”, require at least this cosine gap (reduces confused twins / similar voices). */
+const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.035");
+const speakerMatchSecondStrongMin = Number(process.env.SPEAKER_MATCH_SECOND_STRONG_MIN || "0.84");
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
@@ -392,25 +400,61 @@ const updateSpeakerProfile = async (speakerName, signature) => {
   await speakerStore.writeSpeakerProfiles(profiles);
 };
 
+const getSpeakerMatchRelaxedThreshold = () => {
+  const raw = typeof process.env.SPEAKER_MATCH_RELAXED_THRESHOLD === "string" ? process.env.SPEAKER_MATCH_RELAXED_THRESHOLD.trim() : "";
+  if (raw) {
+    const parsed = Number(raw);
+    if (!Number.isNaN(parsed)) {
+      return Math.min(Math.max(parsed, 0.75), 0.995);
+    }
+  }
+  return Math.max(0.82, speakerSimilarityThreshold - 0.04);
+};
+
+const isAmbiguousSpeakerPair = (best, second) => {
+  if (!second) {
+    return false;
+  }
+  if (second.score < speakerMatchSecondStrongMin) {
+    return false;
+  }
+  return best.score - second.score < speakerMatchMinGapBetweenProfiles;
+};
+
 const detectSpeakerName = async (signature) => {
   const profiles = await speakerStore.readSpeakerProfiles();
   if (profiles.length === 0) {
     return null;
   }
-  let best = null;
+  const scored = [];
   for (const profile of profiles) {
     const score = voiceRecognition.bestCosineScoreAgainstProfile(signature, profile);
     if (score == null) {
       continue;
     }
-    if (!best || score > best.score) {
-      best = { name: profile.name, score };
-    }
+    scored.push({ name: profile.name, score });
   }
-  if (!best || best.score < speakerSimilarityThreshold) {
+  if (scored.length === 0) {
     return null;
   }
-  return best;
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  const second = scored[1];
+  if (isAmbiguousSpeakerPair(best, second)) {
+    return null;
+  }
+  if (best.score >= speakerSimilarityThreshold) {
+    return best;
+  }
+  if (!speakerMatchRelaxedEnabled) {
+    return null;
+  }
+  const relaxed = getSpeakerMatchRelaxedThreshold();
+  const marginOk = !second || best.score - second.score >= speakerMatchMargin;
+  if (marginOk && best.score >= relaxed) {
+    return best;
+  }
+  return null;
 };
 
 app.get("/health", (_req, res) => {

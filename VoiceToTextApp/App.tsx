@@ -108,7 +108,8 @@ export default function App() {
   const [hasLoadedHistory, setHasLoadedHistory] = useState(false);
   const [statusText, setStatusText] = useState("Tap the mic and start speaking.");
   const [errorText, setErrorText] = useState<string | null>(null);
-  const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.975");
+  /** Should match API `SPEAKER_MATCH_THRESHOLD` (same default 0.97) so conflict prompts align with server gating. */
+  const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.97");
 
   const getApiBaseUrl = () => {
     const apiUrl = process.env.EXPO_PUBLIC_TRANSCRIBE_API_URL;
@@ -485,17 +486,18 @@ export default function App() {
         const result = await transcribeAudio(uri, trimmedSpeakerName);
         const text = result.text;
         const manualSpeakerName = trimmedSpeakerName;
-        const hasConfidentDetectedSpeaker =
-          !!result.detectedSpeakerName &&
+        const hasServerDetectedSpeaker = !!result.detectedSpeakerName?.trim();
+        const hasConfidentDetectedForConflict =
+          hasServerDetectedSpeaker &&
           result.speakerConfidence !== null &&
           result.speakerConfidence >= speakerAutoAssignMinConfidence;
 
         let normalizedSpeakerName =
           manualSpeakerName ||
-          (hasConfidentDetectedSpeaker ? result.detectedSpeakerName : null) ||
+          (hasServerDetectedSpeaker ? result.detectedSpeakerName : null) ||
           "Unknown speaker";
 
-        if (manualSpeakerName && hasConfidentDetectedSpeaker && result.detectedSpeakerName) {
+        if (manualSpeakerName && hasConfidentDetectedForConflict && result.detectedSpeakerName) {
           const confirmed = await resolveSpeakerNameConflict(
             manualSpeakerName,
             result,
