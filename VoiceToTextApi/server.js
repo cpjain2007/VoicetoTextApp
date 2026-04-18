@@ -3,6 +3,7 @@ const cors = require("cors");
 const multer = require("multer");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
+const { AssemblyAI } = require("assemblyai");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs/promises");
 const path = require("path");
@@ -24,15 +25,134 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const serverToken = process.env.SERVER_BEARER_TOKEN;
 const openaiApiKey = process.env.OPENAI_API_KEY;
+const assemblyApiKey = process.env.ASSEMBLYAI_API_KEY;
+const openaiAiModel = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
+const assemblySpeechModels = ["universal-3-pro", "universal-2"];
+const forcedLanguageCode = process.env.ASSEMBLYAI_FORCE_LANGUAGE_CODE || "";
+const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,te,bn")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
 
 if (!openaiApiKey) {
-  // Fail early so deployment issues are obvious.
-  console.warn("Warning: OPENAI_API_KEY is missing.");
+  console.warn("Warning: OPENAI_API_KEY is missing. AI features will be disabled.");
+}
+
+if (!assemblyApiKey) {
+  console.warn("Warning: ASSEMBLYAI_API_KEY is missing. Transcription will fail.");
 }
 
 const client = new OpenAI({
   apiKey: openaiApiKey,
 });
+
+const assemblyClient = new AssemblyAI({
+  apiKey: assemblyApiKey || "",
+});
+
+const buildAiInsights = async (text) => {
+  if (!openaiApiKey || !text.trim()) {
+    return null;
+  }
+
+  const response = await client.responses.create({
+    model: openaiAiModel,
+    input: [
+      {
+        role: "system",
+        content:
+          "You summarize transcripts into concise business notes. Return strict JSON with keys summary and actionItems. actionItems must be an array of short strings.",
+      },
+      {
+        role: "user",
+        content: `Transcript:\n${text}`,
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "transcript_insights",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            summary: { type: "string" },
+            actionItems: { type: "array", items: { type: "string" } },
+          },
+          required: ["summary", "actionItems"],
+        },
+      },
+    },
+  });
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return {
+    summary: typeof parsed.summary === "string" ? parsed.summary : "",
+    actionItems: Array.isArray(parsed.actionItems)
+      ? parsed.actionItems.filter((item) => typeof item === "string")
+      : [],
+  };
+};
+
+const buildSpeakerCorrectionSuggestion = async (latestText, recentHistory) => {
+  if (!openaiApiKey || !latestText.trim()) {
+    return null;
+  }
+
+  const compactHistory = Array.isArray(recentHistory)
+    ? recentHistory.slice(0, 5).map((item, index) => ({
+        index,
+        speakerName: typeof item?.speakerName === "string" ? item.speakerName : "",
+        text: typeof item?.text === "string" ? item.text.slice(0, 180) : "",
+      }))
+    : [];
+
+  const response = await client.responses.create({
+    model: openaiAiModel,
+    input: [
+      {
+        role: "system",
+        content:
+          "Detect if user asks to rename the most recent speaker label. Only suggest when explicit rename intent exists in latest transcript. Return strict JSON.",
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          latestText,
+          recentHistory: compactHistory,
+          instruction:
+            "If intent is to rename last log speaker, return shouldSuggest=true and suggestedSpeakerName with clean title case. Otherwise false.",
+        }),
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "speaker_correction",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            shouldSuggest: { type: "boolean" },
+            suggestedSpeakerName: { type: "string" },
+            reason: { type: "string" },
+          },
+          required: ["shouldSuggest", "suggestedSpeakerName", "reason"],
+        },
+      },
+    },
+  });
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return {
+    shouldSuggest: !!parsed.shouldSuggest,
+    suggestedSpeakerName:
+      typeof parsed.suggestedSpeakerName === "string" ? parsed.suggestedSpeakerName.trim() : "",
+    reason: typeof parsed.reason === "string" ? parsed.reason.trim() : "",
+  };
+};
 
 const dotProduct = (a, b) => a.reduce((sum, item, index) => sum + item * (b[index] || 0), 0);
 
@@ -268,8 +388,8 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
       }
     }
 
-    if (!openaiApiKey) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    if (!assemblyApiKey) {
+      return res.status(500).json({ error: "ASSEMBLYAI_API_KEY is not configured." });
     }
 
     if (!req.file) {
@@ -279,24 +399,108 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     const extension = extensionFromMime(req.file.mimetype);
     const pcmBuffer = await convertAudioToPcm(req.file.buffer, extension);
     const voiceSignature = buildVoiceSignature(pcmBuffer);
-    const manualSpeakerName =
-      typeof req.body.speakerName === "string" ? req.body.speakerName.trim() : "";
+    const speakerNameHeader =
+      typeof req.headers["x-speaker-name"] === "string" ? req.headers["x-speaker-name"].trim() : "";
+    const speakerNameQuery =
+      typeof req.query?.speakerName === "string" ? req.query.speakerName.trim() : "";
+    const manualSpeakerNameFromBody =
+      typeof req.body?.speakerName === "string" ? req.body.speakerName.trim() : "";
+    const manualSpeakerName = speakerNameQuery || speakerNameHeader || manualSpeakerNameFromBody;
     if (manualSpeakerName) {
       await updateSpeakerProfile(manualSpeakerName, voiceSignature);
     }
     const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
 
-    const transcript = await client.audio.transcriptions.create({
-      model: "gpt-4o-mini-transcribe",
-      file: await OpenAI.toFile(req.file.buffer, req.file.originalname || "audio.m4a", {
-        type: req.file.mimetype || "audio/m4a",
-      }),
-    });
+    const baseTranscriptOptions = {
+      audio: req.file.buffer,
+      speaker_labels: true,
+      ...(forcedLanguageCode ? { language_code: forcedLanguageCode } : { language_detection: true }),
+    };
+
+    let transcript = null;
+    let lastModelError = null;
+    const modelsToTry = assemblySpeechModels.length > 0 ? assemblySpeechModels : ["best"];
+
+    for (const model of modelsToTry) {
+      try {
+        const candidate = await assemblyClient.transcripts.transcribe({
+          ...baseTranscriptOptions,
+          speech_models: [model],
+        });
+        if (candidate && candidate.status === "error") {
+          lastModelError = new Error(candidate.error || `AssemblyAI rejected model ${model}.`);
+          continue;
+        }
+        transcript = candidate;
+        lastModelError = null;
+        break;
+      } catch (error) {
+        lastModelError = error;
+      }
+    }
+
+    if (!transcript && lastModelError) {
+      const multilingualFallbackOptions = {
+        audio: req.file.buffer,
+        speaker_labels: true,
+        ...(forcedLanguageCode ? { language_code: forcedLanguageCode } : { language_detection: true }),
+        speech_models: ["best"],
+      };
+      const fallbackTranscript = await assemblyClient.transcripts.transcribe(multilingualFallbackOptions);
+      if (!fallbackTranscript || fallbackTranscript.status === "error") {
+        let languageSpecificTranscript = null;
+        let languageSpecificError = null;
+        for (const languageCode of languageFallbackCodes) {
+          const candidate = await assemblyClient.transcripts.transcribe({
+            audio: req.file.buffer,
+            speaker_labels: true,
+            language_code: languageCode,
+            speech_models: ["best"],
+          });
+          if (candidate && candidate.status !== "error") {
+            languageSpecificTranscript = candidate;
+            languageSpecificError = null;
+            break;
+          }
+          languageSpecificError = candidate?.error || `Fallback failed for ${languageCode}.`;
+        }
+        if (!languageSpecificTranscript) {
+          throw new Error(
+            String(
+              languageSpecificError ||
+                (fallbackTranscript && fallbackTranscript.error) ||
+                "AssemblyAI fallback transcription failed.",
+            ),
+          );
+        }
+        transcript = languageSpecificTranscript;
+      } else {
+        transcript = fallbackTranscript;
+      }
+    }
+
+    if (transcript.status === "error") {
+      throw new Error(transcript.error || "AssemblyAI transcription failed.");
+    }
+
+    const transcriptText = transcript.text || "";
+    const utterances = Array.isArray(transcript.utterances) ? transcript.utterances : [];
+    const dominantAssemblySpeakerLabel =
+      utterances.length > 0 && utterances[0].speaker ? `Speaker ${utterances[0].speaker}` : null;
+    const aiInsights = await buildAiInsights(transcriptText).catch(() => null);
 
     return res.json({
-      text: transcript.text || "",
+      text: transcriptText,
       detectedSpeakerName: detectedSpeaker?.name || null,
       speakerConfidence: detectedSpeaker?.score ?? null,
+      assemblySpeakerLabel: dominantAssemblySpeakerLabel,
+      utterances: utterances.map((item) => ({
+        speaker: item.speaker || null,
+        text: item.text || "",
+        start: item.start || 0,
+        end: item.end || 0,
+      })),
+      ai: aiInsights,
     });
   } catch (error) {
     const message =
@@ -304,6 +508,41 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
         ? error.message
         : "Unexpected transcription error.";
     return res.status(500).json({ error: String(message) });
+  }
+});
+
+app.post("/ai/insights", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text.trim()) {
+      return res.status(400).json({ error: "Missing transcript text." });
+    }
+    const insights = await buildAiInsights(text);
+    return res.json({ ai: insights });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "AI insights failed.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/ai/speaker-correction", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const latestText = typeof req.body?.latestText === "string" ? req.body.latestText : "";
+    const recentHistory = Array.isArray(req.body?.recentHistory) ? req.body.recentHistory : [];
+    if (!latestText.trim()) {
+      return res.status(400).json({ error: "Missing latestText." });
+    }
+    const suggestion = await buildSpeakerCorrectionSuggestion(latestText, recentHistory);
+    return res.json({ suggestion });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Speaker correction failed.";
+    return res.status(500).json({ error: message });
   }
 });
 

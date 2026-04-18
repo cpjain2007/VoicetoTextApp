@@ -1,6 +1,8 @@
 # VoiceToText API
 
-Tiny Express API that accepts an uploaded audio file and returns speech-to-text using OpenAI transcription.
+Tiny Express API that accepts an uploaded audio file and:
+- uses AssemblyAI for transcription and speaker-label metadata
+- uses OpenAI for AI insights (summary + action items)
 
 ## 1) Setup
 
@@ -11,9 +13,12 @@ copy .env.example .env
 
 Edit `.env`:
 
-- `OPENAI_API_KEY`: your OpenAI API key.
+- `ASSEMBLYAI_API_KEY`: required for `/transcribe`.
+- `OPENAI_API_KEY`: required for AI features (`/ai/insights` and `ai` field in `/transcribe` response).
 - `SERVER_BEARER_TOKEN`: any token string you choose.
 - `PORT`: optional (default `3001`).
+- `SPEAKER_MATCH_THRESHOLD`: optional float for local speaker-profile matching.
+- `OPENAI_AI_MODEL`: optional OpenAI model (default `gpt-4o-mini`).
 
 Install packages:
 
@@ -41,8 +46,25 @@ Transcribe endpoint:
 Response:
 
 ```json
-{ "text": "your transcript" }
+{
+  "text": "your transcript",
+  "detectedSpeakerName": "Speaker 1",
+  "speakerConfidence": 0.98,
+  "utterances": [
+    { "speaker": "A", "text": "Hello", "start": 0, "end": 520 }
+  ],
+  "ai": {
+    "summary": "Short summary",
+    "actionItems": ["Item 1", "Item 2"]
+  }
+}
 ```
+
+AI insights endpoint:
+
+- `POST http://localhost:3001/ai/insights`
+- `application/json`
+- body: `{ "text": "transcript text" }`
 
 ## 3) Connect from Expo app
 
