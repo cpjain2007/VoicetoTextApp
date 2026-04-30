@@ -1,5 +1,5 @@
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
@@ -23,12 +23,30 @@ type TranscriptLogItem = {
   text: string;
   createdAt: string;
   createdAtMs: number;
+  cloudHistoryId?: string;
+  speakerAttributionSource?: SpeakerAttributionSource;
+  speakerNameInput?: string | null;
+  promptedSpeakerName?: string | null;
+  detectedSpeakerName?: string | null;
+  speakerConfidence?: number | null;
+  matchedEnrollmentSampleId?: string | null;
+  matchedEnrollmentSampleSource?: string | null;
+  matchedEnrollmentSampleCreatedAtIso?: string | null;
+  assemblySpeakerLabel?: string | null;
+  wasSpeakerNameInputProvided?: boolean;
+  wasUnknownSpeakerPromptShown?: boolean;
+  wasVoiceMatchUsed?: boolean;
+  wasConflictPromptShown?: boolean;
+  wasVoiceProfileEnrolled?: boolean;
 };
 
 type TranscriptionResult = {
   text: string;
   detectedSpeakerName: string | null;
   speakerConfidence: number | null;
+  detectedSpeakerSampleId: string | null;
+  detectedSpeakerSampleSource: string | null;
+  detectedSpeakerSampleCreatedAtIso: string | null;
   assemblySpeakerLabel: string | null;
 };
 
@@ -37,6 +55,15 @@ type SpeakerProfile = {
   samples: number;
   /** Optional hint for AssemblyAI Speaker Identification (`speakerDescription` in API store). */
   description?: string;
+  enrollmentSamples?: EnrollmentSample[];
+};
+
+type EnrollmentSample = {
+  sampleId: string;
+  source?: string | null;
+  createdAtMs?: number | null;
+  createdAtIso?: string | null;
+  historyClientId?: string | null;
 };
 
 type SpeakerCorrectionSuggestion = {
@@ -45,12 +72,143 @@ type SpeakerCorrectionSuggestion = {
   reason: string;
 };
 
+type SpeakerAttributionSource =
+  | "speaker_name_input"
+  | "voice_match"
+  | "unknown_speaker_prompt"
+  | "speaker_conflict_prompt"
+  | "unknown";
+
+type AppTab = "record" | "history" | "speakers";
+
 const HISTORY_STORAGE_KEY = "voicetotext.history.v1";
+const UNKNOWN_SPEAKER_LABEL = "Unknown speaker";
+const UNKNOWN_SPEAKER_NAME_MAX_CHARS = 80;
 
 /** Matches default `ASSEMBLYAI_SPEAKER_DESCRIPTION_MAX` on the API. */
 const SPEAKER_DESCRIPTION_MAX_CHARS = 220;
 
 const normalizeSpeakerKey = (value: string) => value.trim().toLowerCase();
+
+const isUnknownSpeakerLabel = (value: string) =>
+  normalizeSpeakerKey(value) === normalizeSpeakerKey(UNKNOWN_SPEAKER_LABEL);
+
+const formatAttributionSource = (source?: SpeakerAttributionSource) => {
+  switch (source) {
+    case "speaker_name_input":
+      return "Typed speaker name";
+    case "voice_match":
+      return "Voice match";
+    case "unknown_speaker_prompt":
+      return "Prompt after unknown speaker";
+    case "speaker_conflict_prompt":
+      return "Conflict prompt";
+    case "unknown":
+    default:
+      return "Unknown source";
+  }
+};
+
+const formatSampleSource = (source?: string | null) => {
+  if (source === "speaker_name_input") {
+    return "Typed name";
+  }
+  if (source === "unknown_speaker_prompt") {
+    return "Unknown prompt";
+  }
+  if (source === "speaker_conflict_prompt") {
+    return "Conflict prompt";
+  }
+  return "Unknown source";
+};
+
+const formatSampleTime = (sample: EnrollmentSample) => {
+  const timestamp = typeof sample.createdAtMs === "number" ? sample.createdAtMs : Date.parse(sample.createdAtIso || "");
+  if (!Number.isFinite(timestamp)) {
+    return "Unknown time";
+  }
+  return new Date(timestamp).toLocaleString(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
+const readString = (item: Record<string, unknown>, key: string) =>
+  typeof item[key] === "string" ? item[key] : "";
+
+const readNullableString = (item: Record<string, unknown>, key: string) => {
+  const value = readString(item, key).trim();
+  return value || null;
+};
+
+const readBoolean = (item: Record<string, unknown>, key: string) => item[key] === true;
+
+const readNullableNumber = (item: Record<string, unknown>, key: string) =>
+  typeof item[key] === "number" && Number.isFinite(item[key]) ? item[key] : null;
+
+const readAttributionSource = (value: unknown): SpeakerAttributionSource | undefined => {
+  if (
+    value === "speaker_name_input" ||
+    value === "voice_match" ||
+    value === "unknown_speaker_prompt" ||
+    value === "speaker_conflict_prompt" ||
+    value === "unknown"
+  ) {
+    return value;
+  }
+  return undefined;
+};
+
+const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const item = value as Record<string, unknown>;
+  const createdAtMs = readNullableNumber(item, "createdAtMs") ?? Date.now();
+  const clientId = readString(item, "clientId").trim();
+  const rawId = readString(item, "id").trim();
+  const id = clientId || rawId || `${createdAtMs}`;
+  const cloudHistoryId = clientId && rawId && rawId !== clientId ? rawId : readString(item, "cloudHistoryId").trim();
+
+  return {
+    id,
+    speakerName: readString(item, "speakerName").trim() || UNKNOWN_SPEAKER_LABEL,
+    text: readString(item, "text"),
+    createdAt: readString(item, "createdAt") || new Date(createdAtMs).toLocaleTimeString(),
+    createdAtMs,
+    ...(cloudHistoryId ? { cloudHistoryId } : {}),
+    speakerAttributionSource: readAttributionSource(item.speakerAttributionSource),
+    speakerNameInput: readNullableString(item, "speakerNameInput"),
+    promptedSpeakerName: readNullableString(item, "promptedSpeakerName"),
+    detectedSpeakerName: readNullableString(item, "detectedSpeakerName"),
+    speakerConfidence: readNullableNumber(item, "speakerConfidence"),
+    matchedEnrollmentSampleId: readNullableString(item, "matchedEnrollmentSampleId"),
+    matchedEnrollmentSampleSource: readNullableString(item, "matchedEnrollmentSampleSource"),
+    matchedEnrollmentSampleCreatedAtIso: readNullableString(item, "matchedEnrollmentSampleCreatedAtIso"),
+    assemblySpeakerLabel: readNullableString(item, "assemblySpeakerLabel"),
+    wasSpeakerNameInputProvided: readBoolean(item, "wasSpeakerNameInputProvided"),
+    wasUnknownSpeakerPromptShown: readBoolean(item, "wasUnknownSpeakerPromptShown"),
+    wasVoiceMatchUsed: readBoolean(item, "wasVoiceMatchUsed"),
+    wasConflictPromptShown: readBoolean(item, "wasConflictPromptShown"),
+    wasVoiceProfileEnrolled: readBoolean(item, "wasVoiceProfileEnrolled"),
+  };
+};
+
+const mergeHistoryEntries = (localEntries: TranscriptLogItem[], cloudEntries: TranscriptLogItem[]) => {
+  const merged = new Map<string, TranscriptLogItem>();
+  const keyFor = (item: TranscriptLogItem) =>
+    item.cloudHistoryId || item.id || `${item.createdAtMs}:${item.speakerName}:${item.text.slice(0, 60)}`;
+
+  [...localEntries, ...cloudEntries].forEach((item) => {
+    const key = keyFor(item);
+    const existing = merged.get(key);
+    merged.set(key, existing ? { ...existing, ...item } : item);
+  });
+
+  return [...merged.values()].sort((a, b) => b.createdAtMs - a.createdAtMs);
+};
 
 const resolveSpeakerNameConflict = (
   manualName: string,
@@ -96,10 +254,10 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [history, setHistory] = useState<TranscriptLogItem[]>([]);
-  const [isHistoryVisible, setIsHistoryVisible] = useState(true);
+  const [activeTab, setActiveTab] = useState<AppTab>("record");
   const [expandedHistoryIds, setExpandedHistoryIds] = useState<string[]>([]);
   const [speakerName, setSpeakerName] = useState("");
-  const [lastSpeakerName, setLastSpeakerName] = useState("Unknown speaker");
+  const [lastSpeakerName, setLastSpeakerName] = useState(UNKNOWN_SPEAKER_LABEL);
   const [isEnrollMode, setIsEnrollMode] = useState(false);
   const [speakers, setSpeakers] = useState<SpeakerProfile[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
@@ -111,6 +269,25 @@ export default function App() {
   /** Should match API `SPEAKER_MATCH_THRESHOLD` (same default 0.97) so conflict prompts align with server gating. */
   const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.97");
 
+  const unknownSpeakerResolveRef = useRef<((value: string) => void) | null>(null);
+  const [unknownSpeakerModalVisible, setUnknownSpeakerModalVisible] = useState(false);
+  const [unknownSpeakerDraft, setUnknownSpeakerDraft] = useState("");
+
+  const closeUnknownSpeakerPrompt = (value: string) => {
+    setUnknownSpeakerModalVisible(false);
+    setUnknownSpeakerDraft("");
+    const resolve = unknownSpeakerResolveRef.current;
+    unknownSpeakerResolveRef.current = null;
+    resolve?.(value);
+  };
+
+  const openUnknownSpeakerNamePrompt = () =>
+    new Promise<string>((resolve) => {
+      unknownSpeakerResolveRef.current = resolve;
+      setUnknownSpeakerDraft("");
+      setUnknownSpeakerModalVisible(true);
+    });
+
   const getApiBaseUrl = () => {
     const apiUrl = process.env.EXPO_PUBLIC_TRANSCRIBE_API_URL;
     if (!apiUrl) {
@@ -121,7 +298,7 @@ export default function App() {
 
   const canShowTranscript = useMemo(() => transcript.length > 0, [transcript]);
   const isRecording = recording !== null;
-  const isBusy = isRecording || isUploading;
+  const isBusy = isRecording || isUploading || unknownSpeakerModalVisible;
 
   const createTimeLabel = (timestampMs: number) =>
     new Date(timestampMs).toLocaleTimeString(undefined, {
@@ -130,25 +307,11 @@ export default function App() {
       second: "2-digit",
     });
 
-  const getDayBucket = (timestampMs: number) => {
-    const date = new Date(timestampMs);
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const oneDayMs = 24 * 60 * 60 * 1000;
-    if (timestampMs >= todayStart) {
-      return "Today";
-    }
-    if (timestampMs >= todayStart - oneDayMs) {
-      return "Yesterday";
-    }
-    return date.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-    });
-  };
-
-  const transcribeAudio = async (uri: string, currentSpeakerName: string) => {
+  const transcribeAudio = async (
+    uri: string,
+    currentSpeakerName: string,
+    options: { enrollmentSource?: SpeakerAttributionSource; historyClientId?: string } = {},
+  ) => {
     const apiUrl = process.env.EXPO_PUBLIC_TRANSCRIBE_API_URL;
     const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
     if (!apiUrl) {
@@ -162,6 +325,10 @@ export default function App() {
       "Content-Type": "application/json",
       ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
       ...(trimmedSpeakerName ? { "x-speaker-name": trimmedSpeakerName } : {}),
+      ...(trimmedSpeakerName && options.enrollmentSource
+        ? { "x-enrollment-source": options.enrollmentSource }
+        : {}),
+      ...(options.historyClientId ? { "x-history-client-id": options.historyClientId } : {}),
     };
 
     let audioBase64: string;
@@ -200,6 +367,10 @@ export default function App() {
         audioBase64,
         mimeType: "audio/m4a",
         ...(trimmedSpeakerName ? { speakerName: trimmedSpeakerName } : {}),
+        ...(trimmedSpeakerName && options.enrollmentSource
+          ? { enrollmentSource: options.enrollmentSource }
+          : {}),
+        ...(options.historyClientId ? { historyClientId: options.historyClientId } : {}),
       }),
     });
 
@@ -213,6 +384,9 @@ export default function App() {
       transcript?: string;
       detectedSpeakerName?: string | null;
       speakerConfidence?: number | null;
+      detectedSpeakerSampleId?: string | null;
+      detectedSpeakerSampleSource?: string | null;
+      detectedSpeakerSampleCreatedAtIso?: string | null;
       assemblySpeakerLabel?: string | null;
       speakerIdentificationCandidates?: string[];
       speakerIdentificationMapping?: Record<string, unknown> | null;
@@ -221,11 +395,71 @@ export default function App() {
       text: data.text?.trim() || data.transcript?.trim() || "",
       detectedSpeakerName: data.detectedSpeakerName?.trim() || null,
       speakerConfidence: typeof data.speakerConfidence === "number" ? data.speakerConfidence : null,
+      detectedSpeakerSampleId:
+        typeof data.detectedSpeakerSampleId === "string" && data.detectedSpeakerSampleId.trim()
+          ? data.detectedSpeakerSampleId.trim()
+          : null,
+      detectedSpeakerSampleSource:
+        typeof data.detectedSpeakerSampleSource === "string" && data.detectedSpeakerSampleSource.trim()
+          ? data.detectedSpeakerSampleSource.trim()
+          : null,
+      detectedSpeakerSampleCreatedAtIso:
+        typeof data.detectedSpeakerSampleCreatedAtIso === "string" &&
+        data.detectedSpeakerSampleCreatedAtIso.trim()
+          ? data.detectedSpeakerSampleCreatedAtIso.trim()
+          : null,
       assemblySpeakerLabel:
         typeof data.assemblySpeakerLabel === "string" && data.assemblySpeakerLabel.trim()
           ? data.assemblySpeakerLabel.trim()
           : null,
     } satisfies TranscriptionResult;
+  };
+
+  const saveHistoryEntryToCloud = async (entry: TranscriptLogItem) => {
+    try {
+      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const response = await fetch(`${getApiBaseUrl()}/history`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        },
+        body: JSON.stringify(entry),
+      });
+      if (!response.ok) {
+        const bodyText = await response.text();
+        throw new Error(bodyText || `Cloud history save failed (${response.status}).`);
+      }
+      const data = (await response.json()) as { history?: { id?: string } };
+      const cloudHistoryId = typeof data.history?.id === "string" ? data.history.id : null;
+      if (cloudHistoryId) {
+        setHistory((current) =>
+          current.map((item) => (item.id === entry.id ? { ...item, cloudHistoryId } : item)),
+        );
+      }
+    } catch (error) {
+      console.warn("Cloud history save failed", error);
+    }
+  };
+
+  const fetchCloudHistory = async () => {
+    try {
+      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const response = await fetch(`${getApiBaseUrl()}/history?limit=100`, {
+        headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
+      });
+      if (!response.ok) {
+        const bodyText = await response.text();
+        throw new Error(bodyText || `Cloud history load failed (${response.status}).`);
+      }
+      const data = (await response.json()) as { history?: unknown[] };
+      return Array.isArray(data.history)
+        ? data.history.map(normalizeHistoryItem).filter((item): item is TranscriptLogItem => item !== null)
+        : [];
+    } catch (error) {
+      console.warn("Cloud history load failed", error);
+      return [];
+    }
   };
 
   const fetchSpeakers = async (suppressError = false) => {
@@ -415,33 +649,70 @@ export default function App() {
     );
   };
 
+  const deleteVoiceSample = (speakerName: string, sampleId: string) => {
+    Alert.alert(
+      "Delete Voice Sample?",
+      `Remove this enrollment sample from ${speakerName}? The speaker match profile will be rebuilt from remaining samples.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              try {
+                setErrorText(null);
+                const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+                const response = await fetch(
+                  `${getApiBaseUrl()}/speakers/${encodeURIComponent(speakerName)}/samples/${encodeURIComponent(sampleId)}`,
+                  {
+                    method: "DELETE",
+                    headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
+                  },
+                );
+                const bodyText = await response.text();
+                if (!response.ok) {
+                  throw new Error(bodyText || `Could not delete sample (${response.status}).`);
+                }
+                setStatusText(`Deleted voice sample for ${speakerName}.`);
+                await fetchSpeakers(true);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : "Could not delete voice sample.";
+                setErrorText(message);
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
   useEffect(() => {
     fetchSpeakers();
   }, []);
 
   useEffect(() => {
     const loadHistory = async () => {
+      let localHistory: TranscriptLogItem[] = [];
       try {
         const raw = await AsyncStorage.getItem(HISTORY_STORAGE_KEY);
-        if (!raw) {
-          return;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            localHistory = parsed
+              .map(normalizeHistoryItem)
+              .filter((item): item is TranscriptLogItem => item !== null);
+          }
         }
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) {
-          return;
-        }
-        const hydrated = parsed
-          .filter((item) => item && typeof item === "object")
-          .map((item) => ({
-            id: typeof item.id === "string" ? item.id : `${Date.now()}`,
-            speakerName: typeof item.speakerName === "string" ? item.speakerName : "Unknown speaker",
-            text: typeof item.text === "string" ? item.text : "",
-            createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
-            createdAtMs: typeof item.createdAtMs === "number" ? item.createdAtMs : Date.now(),
-          })) as TranscriptLogItem[];
-        setHistory(hydrated);
       } catch {
         // Keep app usable even if local history cannot be read.
+      }
+
+      try {
+        const cloudHistory = await fetchCloudHistory();
+        setHistory(mergeHistoryEntries(localHistory, cloudHistory));
+      } catch {
+        setHistory(localHistory);
       } finally {
         setHasLoadedHistory(true);
       }
@@ -483,9 +754,22 @@ export default function App() {
           throw new Error("Enter a speaker name before recording in enroll mode.");
         }
 
-        const result = await transcribeAudio(uri, trimmedSpeakerName);
+        const createdAtMs = Date.now();
+        const historyClientId = `${createdAtMs}`;
+        const result = await transcribeAudio(uri, trimmedSpeakerName, {
+          enrollmentSource: trimmedSpeakerName ? "speaker_name_input" : undefined,
+          historyClientId,
+        });
         const text = result.text;
         const manualSpeakerName = trimmedSpeakerName;
+        let shouldRefreshSpeakers = !!manualSpeakerName;
+        let voiceEnrollmentRequestFailed = false;
+        /** Set when unknown-speaker flow successfully re-uploaded audio with a name (server enrollment). */
+        let enrolledVoiceAsName: string | null = null;
+        let promptedSpeakerName: string | null = null;
+        let wasUnknownSpeakerPromptShown = false;
+        let wasConflictPromptShown = false;
+        let wasVoiceMatchUsed = false;
         const hasServerDetectedSpeaker = !!result.detectedSpeakerName?.trim();
         const hasConfidentDetectedForConflict =
           hasServerDetectedSpeaker &&
@@ -495,29 +779,91 @@ export default function App() {
         let normalizedSpeakerName =
           manualSpeakerName ||
           (hasServerDetectedSpeaker ? result.detectedSpeakerName : null) ||
-          "Unknown speaker";
+          UNKNOWN_SPEAKER_LABEL;
+        let speakerAttributionSource: SpeakerAttributionSource = manualSpeakerName
+          ? "speaker_name_input"
+          : hasServerDetectedSpeaker
+            ? "voice_match"
+            : "unknown";
+        if (!manualSpeakerName && hasServerDetectedSpeaker) {
+          wasVoiceMatchUsed = true;
+        }
 
         if (manualSpeakerName && hasConfidentDetectedForConflict && result.detectedSpeakerName) {
+          wasConflictPromptShown = true;
           const confirmed = await resolveSpeakerNameConflict(
             manualSpeakerName,
             result,
             speakerAutoAssignMinConfidence,
           );
           normalizedSpeakerName = confirmed || normalizedSpeakerName;
+          speakerAttributionSource =
+            normalizeSpeakerKey(confirmed) === normalizeSpeakerKey(result.detectedSpeakerName)
+              ? "voice_match"
+              : "speaker_conflict_prompt";
+          wasVoiceMatchUsed = speakerAttributionSource === "voice_match";
           if (normalizeSpeakerKey(confirmed) !== normalizeSpeakerKey(manualSpeakerName)) {
             setSpeakerName(confirmed);
           }
         }
 
+        if (isUnknownSpeakerLabel(normalizedSpeakerName)) {
+          setIsUploading(false);
+          wasUnknownSpeakerPromptShown = true;
+          const entered = await openUnknownSpeakerNamePrompt();
+          const trimmedEntered = entered.trim();
+          promptedSpeakerName = trimmedEntered || null;
+          normalizedSpeakerName = trimmedEntered || UNKNOWN_SPEAKER_LABEL;
+          if (trimmedEntered) {
+            speakerAttributionSource = "unknown_speaker_prompt";
+            setSpeakerName(trimmedEntered);
+            try {
+              setIsUploading(true);
+              setStatusText("Saving voice profile…");
+              await transcribeAudio(uri, trimmedEntered, {
+                enrollmentSource: "unknown_speaker_prompt",
+                historyClientId,
+              });
+              shouldRefreshSpeakers = true;
+              enrolledVoiceAsName = trimmedEntered;
+            } catch (enrollError) {
+              voiceEnrollmentRequestFailed = true;
+              const enrollMessage =
+                enrollError instanceof Error
+                  ? enrollError.message
+                  : "Voice profile could not be saved on the server.";
+              setErrorText(enrollMessage);
+              setStatusText(
+                "Transcript saved locally. Enrollment failed — try recording again with the speaker name filled in.",
+              );
+            } finally {
+              setIsUploading(false);
+            }
+          }
+        }
+
         setTranscript(text);
         setLastSpeakerName(normalizedSpeakerName);
-        const createdAtMs = Date.now();
         const newHistoryEntry: TranscriptLogItem = {
-          id: `${createdAtMs}`,
+          id: historyClientId,
           speakerName: normalizedSpeakerName,
           text,
           createdAt: createTimeLabel(createdAtMs),
           createdAtMs,
+          speakerAttributionSource,
+          speakerNameInput: manualSpeakerName || null,
+          promptedSpeakerName,
+          detectedSpeakerName: result.detectedSpeakerName,
+          speakerConfidence: result.speakerConfidence,
+          matchedEnrollmentSampleId: result.detectedSpeakerSampleId,
+          matchedEnrollmentSampleSource: result.detectedSpeakerSampleSource,
+          matchedEnrollmentSampleCreatedAtIso: result.detectedSpeakerSampleCreatedAtIso,
+          assemblySpeakerLabel: result.assemblySpeakerLabel,
+          wasSpeakerNameInputProvided: !!manualSpeakerName,
+          wasUnknownSpeakerPromptShown,
+          wasVoiceMatchUsed,
+          wasConflictPromptShown,
+          wasVoiceProfileEnrolled: !!enrolledVoiceAsName || (!!manualSpeakerName && !voiceEnrollmentRequestFailed),
         };
         const nextHistory = [newHistoryEntry, ...history];
         setHistory((current) => [
@@ -526,11 +872,21 @@ export default function App() {
           },
           ...current,
         ]);
-        void maybeSuggestSpeakerCorrection(text, nextHistory);
-        if (manualSpeakerName) {
+        void saveHistoryEntryToCloud(newHistoryEntry);
+        if (shouldRefreshSpeakers) {
           void fetchSpeakers(true);
         }
-        setStatusText(text ? "Transcription complete." : "No speech detected.");
+        if (!voiceEnrollmentRequestFailed) {
+          if (enrolledVoiceAsName) {
+            setStatusText(
+              text
+                ? `Transcription complete. Voice saved for ${enrolledVoiceAsName} — see Known Speakers below.`
+                : `No speech detected. Voice still saved for ${enrolledVoiceAsName} for recognition next time.`,
+            );
+          } else {
+            setStatusText(text ? "Transcription complete." : "No speech detected.");
+          }
+        }
         return;
       }
 
@@ -568,13 +924,17 @@ export default function App() {
   const groupedHistory = useMemo(() => {
     const groups = new Map<string, TranscriptLogItem[]>();
     history.forEach((item) => {
-      const timestampMs = item.createdAtMs || Date.parse(item.createdAt) || Date.now();
-      const bucket = getDayBucket(timestampMs);
+      const bucket = item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
       const existing = groups.get(bucket) || [];
       existing.push(item);
       groups.set(bucket, existing);
     });
-    return Array.from(groups.entries());
+    return Array.from(groups.entries())
+      .map(([speaker, items]) => [
+        speaker,
+        [...items].sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0)),
+      ] as const)
+      .sort(([, aItems], [, bItems]) => (bItems[0]?.createdAtMs || 0) - (aItems[0]?.createdAtMs || 0));
   }, [history]);
 
   return (
@@ -643,76 +1003,140 @@ export default function App() {
           </View>
         </View>
       </Modal>
+      <Modal
+        visible={unknownSpeakerModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => closeUnknownSpeakerPrompt("")}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={() => closeUnknownSpeakerPrompt("")} />
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Who was speaking?</Text>
+            <Text style={styles.modalSubtitle}>
+              No enrolled voice matched this clip. Enter their name to label this transcript and send the same
+              recording to the server to enroll their voice for next time. Tap Skip to keep the Unknown speaker label
+              without enrolling.
+            </Text>
+            <TextInput
+              style={[styles.modalInput, styles.modalInputSingleLine]}
+              placeholder="e.g. Alice"
+              placeholderTextColor="#6b769e"
+              value={unknownSpeakerDraft}
+              onChangeText={(text) => setUnknownSpeakerDraft(text.slice(0, UNKNOWN_SPEAKER_NAME_MAX_CHARS))}
+              maxLength={UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+              autoCapitalize="words"
+              autoFocus
+            />
+            <Text style={styles.modalCharCount}>
+              {unknownSpeakerDraft.length}/{UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => closeUnknownSpeakerPrompt("")}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Skip</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.modalButton,
+                  styles.modalButtonPrimary,
+                  !unknownSpeakerDraft.trim() && styles.modalButtonDisabled,
+                ]}
+                disabled={!unknownSpeakerDraft.trim()}
+                onPress={() => closeUnknownSpeakerPrompt(unknownSpeakerDraft.trim())}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <View style={styles.card}>
         <Text style={styles.kicker}>VOICE TO TEXT</Text>
         <Text style={styles.title}>Speak. Capture. Review.</Text>
         <Text style={styles.subtitle}>{statusText}</Text>
 
-        <TextInput
-          style={styles.speakerInput}
-          placeholder={isEnrollMode ? "Required in enroll mode (e.g. Alice)" : "Optional speaker name (e.g. Alice)"}
-          placeholderTextColor="#8f98bb"
-          value={speakerName}
-          onChangeText={setSpeakerName}
-          autoCapitalize="words"
-        />
-
-        <Pressable
-          style={styles.nextSpeakerButton}
-          onPress={() => setIsEnrollMode((current) => !current)}
-        >
-          <Text style={styles.nextSpeakerButtonText}>
-            {isEnrollMode ? "Enroll Mode: ON" : "Enroll Mode: OFF"}
-          </Text>
-        </Pressable>
-
-        <View style={styles.speakerActionsRow}>
-          <Pressable style={styles.smallActionButton} onPress={fetchSpeakers}>
-            <Text style={styles.smallActionButtonText}>Refresh Speakers</Text>
+        <View style={styles.tabBar}>
+          <Pressable
+            style={[styles.tabButton, activeTab === "record" && styles.tabButtonActive]}
+            onPress={() => setActiveTab("record")}
+          >
+            <Text style={[styles.tabButtonText, activeTab === "record" && styles.tabButtonTextActive]}>
+              Record
+            </Text>
           </Pressable>
-          <Pressable style={styles.smallActionButton} onPress={clearSpeakerProfiles}>
-            <Text style={styles.smallActionButtonText}>Reset Speakers</Text>
+          <Pressable
+            style={[styles.tabButton, activeTab === "history" && styles.tabButtonActive]}
+            onPress={() => setActiveTab("history")}
+          >
+            <Text style={[styles.tabButtonText, activeTab === "history" && styles.tabButtonTextActive]}>
+              History
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[styles.tabButton, activeTab === "speakers" && styles.tabButtonActive]}
+            onPress={() => setActiveTab("speakers")}
+          >
+            <Text style={[styles.tabButtonText, activeTab === "speakers" && styles.tabButtonTextActive]}>
+              Speakers
+            </Text>
           </Pressable>
         </View>
-
-        <Pressable
-          style={[styles.recordButton, isBusy && styles.recordButtonActive]}
-          onPress={handleRecordPress}
-        >
-          <Text style={styles.recordButtonText}>
-            {isUploading
-              ? "Transcribing..."
-              : isRecording
-                ? "Stop Recording"
-                : "Start Recording"}
-          </Text>
-        </Pressable>
-
-        <Pressable
-          style={styles.historyToggleButton}
-          onPress={() => setIsHistoryVisible((current) => !current)}
-        >
-          <Text style={styles.historyToggleButtonText}>
-            {isHistoryVisible ? "Hide History" : "Show History"}
-          </Text>
-        </Pressable>
 
         {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
 
-        <View style={styles.transcriptPanel}>
-          <Text style={styles.panelTitle}>Transcript</Text>
-          <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
-          <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
-            <Text style={styles.transcriptText}>
-              {canShowTranscript
-                ? transcript
-                : "Your spoken words will appear here once recognition starts."}
-            </Text>
-          </ScrollView>
-        </View>
+        {activeTab === "record" ? (
+          <View style={styles.tabContent}>
+            <Text style={styles.tabIntro}>Enter a speaker name only when you want to label or enroll this recording.</Text>
+            <TextInput
+              style={styles.speakerInput}
+              placeholder={isEnrollMode ? "Required in enroll mode (e.g. Alice)" : "Optional speaker name (e.g. Alice)"}
+              placeholderTextColor="#8f98bb"
+              value={speakerName}
+              onChangeText={setSpeakerName}
+              autoCapitalize="words"
+            />
 
-        {isHistoryVisible ? (
-          <View style={styles.historyPanel}>
+            <Pressable
+              style={styles.nextSpeakerButton}
+              onPress={() => setIsEnrollMode((current) => !current)}
+            >
+              <Text style={styles.nextSpeakerButtonText}>
+                {isEnrollMode ? "Enroll Mode: ON" : "Enroll Mode: OFF"}
+              </Text>
+            </Pressable>
+
+            <Pressable
+              style={[styles.recordButton, isBusy && styles.recordButtonActive]}
+              onPress={handleRecordPress}
+            >
+              <Text style={styles.recordButtonText}>
+                {isUploading
+                  ? "Transcribing..."
+                  : isRecording
+                    ? "Stop Recording"
+                    : "Start Recording"}
+              </Text>
+            </Pressable>
+
+            <View style={styles.transcriptPanel}>
+              <Text style={styles.panelTitle}>Transcript</Text>
+              <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
+              <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
+                <Text style={styles.transcriptText}>
+                  {canShowTranscript
+                    ? transcript
+                    : "Your spoken words will appear here once recognition starts."}
+                </Text>
+              </ScrollView>
+            </View>
+          </View>
+        ) : null}
+
+        {activeTab === "history" ? (
+          <View style={[styles.historyPanel, styles.tabPanel]}>
             <View style={styles.historyHeaderRow}>
               <Text style={styles.panelTitle}>Log History</Text>
               <Text style={styles.historyCountText}>
@@ -725,14 +1149,16 @@ export default function App() {
               ) : (
                 groupedHistory.map(([groupTitle, items]) => (
                   <View key={groupTitle} style={styles.historyGroup}>
-                    <Text style={styles.historyGroupTitle}>{groupTitle}</Text>
+                    <Text style={styles.historyGroupTitle}>
+                      {groupTitle} ({items.length})
+                    </Text>
                     {items.map((item) => (
                       <View key={item.id} style={styles.historyItem}>
                         <Pressable
                           style={styles.historySpeakerRow}
                           onPress={() => toggleHistoryItemExpanded(item.id)}
                         >
-                          <Text style={styles.historySpeaker}>{item.speakerName}</Text>
+                          <Text style={styles.historySpeaker}>{item.createdAt}</Text>
                           <Text style={styles.historyExpandHint}>
                             {expandedHistoryIds.includes(item.id) ? "Hide" : "View"}
                           </Text>
@@ -748,6 +1174,21 @@ export default function App() {
                                 <Text style={styles.deleteLogButtonText}>Delete</Text>
                               </Pressable>
                             </View>
+                            <Text style={styles.historyAttribution}>
+                              Source: {formatAttributionSource(item.speakerAttributionSource)}
+                              {typeof item.speakerConfidence === "number"
+                                ? ` • Confidence: ${(item.speakerConfidence * 100).toFixed(0)}%`
+                                : ""}
+                            </Text>
+                            {item.speakerNameInput ? (
+                              <Text style={styles.historyAttribution}>Typed name: {item.speakerNameInput}</Text>
+                            ) : null}
+                            {item.promptedSpeakerName ? (
+                              <Text style={styles.historyAttribution}>Prompted name: {item.promptedSpeakerName}</Text>
+                            ) : null}
+                            <Text style={styles.historyAttribution}>
+                              Matched sample: {item.matchedEnrollmentSampleId || (item.wasSpeakerNameInputProvided ? "User input" : "None")}
+                            </Text>
                             <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
                           </View>
                         ) : null}
@@ -760,39 +1201,71 @@ export default function App() {
           </View>
         ) : null}
 
-        <View style={styles.speakerListPanel}>
-          <Text style={styles.panelTitle}>Known Speakers</Text>
-          <Text style={styles.speakerListHelp}>
-            Tap a speaker to add a short hint for AssemblyAI (accent, role, topics). Leave blank to clear.
-          </Text>
-          {isLoadingSpeakers ? (
-            <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
-          ) : speakers.length === 0 ? (
-            <Text style={styles.historyEmptyText}>No enrolled speakers yet.</Text>
-          ) : (
-            speakers.map((speaker) => (
-              <Pressable
-                key={speaker.name}
-                style={styles.speakerListRow}
-                onPress={() => openSpeakerHintModal(speaker)}
-              >
-                <View style={styles.speakerListRowMain}>
-                  <Text style={styles.speakerListName}>
-                    {speaker.name} ({speaker.samples} samples)
-                  </Text>
-                  {speaker.description ? (
-                    <Text style={styles.speakerListHint} numberOfLines={2}>
-                      {speaker.description}
-                    </Text>
-                  ) : (
-                    <Text style={styles.speakerListHintPlaceholder}>No hint — tap to add</Text>
-                  )}
-                </View>
-                <Text style={styles.speakerListEdit}>Edit</Text>
+        {activeTab === "speakers" ? (
+          <View style={styles.tabContent}>
+            <View style={styles.speakerActionsRow}>
+              <Pressable style={styles.smallActionButton} onPress={() => fetchSpeakers()}>
+                <Text style={styles.smallActionButtonText}>Refresh Speakers</Text>
               </Pressable>
-            ))
-          )}
-        </View>
+            </View>
+
+            <View style={styles.speakerListPanel}>
+              <Text style={styles.panelTitle}>Known Speakers</Text>
+              <Text style={styles.speakerListHelp}>
+                Tap a speaker to add a short hint for AssemblyAI (accent, role, topics). Leave blank to clear.
+              </Text>
+              {isLoadingSpeakers ? (
+                <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
+              ) : speakers.length === 0 ? (
+                <Text style={styles.historyEmptyText}>No enrolled speakers yet.</Text>
+              ) : (
+                speakers.map((speaker) => (
+                  <View key={speaker.name} style={styles.speakerListRow}>
+                    <View style={styles.speakerListHeaderRow}>
+                      <View style={styles.speakerListRowMain}>
+                        <Text style={styles.speakerListName}>
+                          {speaker.name} ({speaker.samples} samples)
+                        </Text>
+                        {speaker.description ? (
+                          <Text style={styles.speakerListHint} numberOfLines={2}>
+                            {speaker.description}
+                          </Text>
+                        ) : (
+                          <Text style={styles.speakerListHintPlaceholder}>No hint added</Text>
+                        )}
+                      </View>
+                      <Pressable onPress={() => openSpeakerHintModal(speaker)}>
+                        <Text style={styles.speakerListEdit}>Edit Hint</Text>
+                      </Pressable>
+                    </View>
+                    {speaker.enrollmentSamples?.length ? (
+                      <View style={styles.sampleList}>
+                        {speaker.enrollmentSamples.map((sample) => (
+                          <View key={sample.sampleId} style={styles.sampleRow}>
+                            <View style={styles.sampleRowMain}>
+                              <Text style={styles.sampleTitle}>{formatSampleTime(sample)}</Text>
+                              <Text style={styles.sampleMeta}>
+                                {formatSampleSource(sample.source)} • {sample.sampleId.slice(0, 8)}
+                              </Text>
+                            </View>
+                            <Pressable
+                              style={styles.sampleDeleteButton}
+                              onPress={() => deleteVoiceSample(speaker.name, sample.sampleId)}
+                            >
+                              <Text style={styles.sampleDeleteText}>Delete</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </View>
+                    ) : (
+                      <Text style={styles.speakerListHintPlaceholder}>No deletable sample metadata yet.</Text>
+                    )}
+                  </View>
+                ))
+              )}
+            </View>
+          </View>
+        ) : null}
       </View>
     </SafeAreaView>
   );
@@ -802,8 +1275,9 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: "#0b1020",
-    justifyContent: "center",
+    justifyContent: "flex-start",
     paddingHorizontal: 20,
+    paddingVertical: 20,
   },
   card: {
     borderRadius: 24,
@@ -830,8 +1304,48 @@ const styles = StyleSheet.create({
   subtitle: {
     color: "#b9c1dd",
     marginTop: 8,
-    marginBottom: 22,
+    marginBottom: 14,
     fontSize: 14,
+  },
+  tabBar: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 14,
+    borderRadius: 14,
+    backgroundColor: "#0f152b",
+    borderWidth: 1,
+    borderColor: "#202c55",
+    padding: 4,
+  },
+  tabButton: {
+    flex: 1,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 9,
+  },
+  tabButtonActive: {
+    backgroundColor: "#6a7cff",
+  },
+  tabButtonText: {
+    color: "#9ba8d8",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  tabButtonTextActive: {
+    color: "#ffffff",
+  },
+  tabContent: {
+    marginTop: 2,
+  },
+  tabIntro: {
+    color: "#9aaad8",
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 10,
+  },
+  tabPanel: {
+    marginTop: 2,
   },
   speakerInput: {
     borderRadius: 12,
@@ -953,8 +1467,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#0f152b",
     borderWidth: 1,
     borderColor: "#202c55",
-    minHeight: 160,
-    maxHeight: 240,
+    minHeight: 360,
+    maxHeight: 560,
   },
   historyScroll: {
     marginTop: 8,
@@ -1030,6 +1544,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
   },
+  historyAttribution: {
+    color: "#8ea1df",
+    fontSize: 11,
+    lineHeight: 16,
+    marginBottom: 4,
+  },
   deleteLogButton: {
     borderRadius: 8,
     borderWidth: 1,
@@ -1064,9 +1584,6 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   speakerListRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
     marginHorizontal: 10,
     marginTop: 8,
     paddingHorizontal: 10,
@@ -1075,6 +1592,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#131c39",
     borderWidth: 1,
     borderColor: "#253264",
+    gap: 10,
+  },
+  speakerListHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     gap: 10,
   },
   speakerListRowMain: {
@@ -1103,6 +1626,46 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
   },
+  sampleList: {
+    marginTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#253264",
+    paddingTop: 8,
+    gap: 8,
+  },
+  sampleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  sampleRowMain: {
+    flex: 1,
+    minWidth: 0,
+  },
+  sampleTitle: {
+    color: "#d5deff",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  sampleMeta: {
+    color: "#8393c8",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  sampleDeleteButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#7b3f53",
+    backgroundColor: "#2b1520",
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  sampleDeleteText: {
+    color: "#ff9bae",
+    fontSize: 11,
+    fontWeight: "700",
+  },
   modalBackdrop: {
     flex: 1,
     justifyContent: "center",
@@ -1127,6 +1690,14 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 6,
     lineHeight: 17,
+  },
+  modalInputSingleLine: {
+    minHeight: 48,
+    maxHeight: 48,
+    paddingVertical: 12,
+  },
+  modalButtonDisabled: {
+    opacity: 0.45,
   },
   modalInput: {
     marginTop: 14,

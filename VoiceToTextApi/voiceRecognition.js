@@ -347,6 +347,52 @@ const bestCosineScoreAgainstProfile = (signature, profile) => {
   return best;
 };
 
+const bestSpeakerMatchAgainstProfile = (signature, profile) => {
+  if (!Array.isArray(signature) || signature.length === 0) {
+    return null;
+  }
+  const dim = signature.length;
+  const candidates = [];
+  if (Array.isArray(profile?.enrollmentSamples)) {
+    for (const sample of profile.enrollmentSamples) {
+      if (Array.isArray(sample?.vector) && sample.vector.length > 0) {
+        candidates.push({
+          vector: padVoiceVector(sample.vector, dim, 0.5),
+          sampleId: typeof sample.sampleId === "string" ? sample.sampleId : null,
+          sampleSource: typeof sample.source === "string" ? sample.source : null,
+          sampleCreatedAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
+        });
+      }
+    }
+  }
+  if (candidates.length === 0 && Array.isArray(profile?.vector) && profile.vector.length > 0) {
+    candidates.push({ vector: padVoiceVector(profile.vector, dim, 0.5) });
+  }
+  if (candidates.length === 0 && Array.isArray(profile?.vectorsRecent)) {
+    for (const v of profile.vectorsRecent) {
+      if (Array.isArray(v) && v.length > 0) {
+        candidates.push({ vector: padVoiceVector(v, dim, 0.5) });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return null;
+  }
+  let best = null;
+  for (const candidate of candidates) {
+    const score = cosineSimilarity(signature, candidate.vector);
+    if (!best || score > best.score) {
+      best = {
+        score,
+        sampleId: candidate.sampleId || null,
+        sampleSource: candidate.sampleSource || null,
+        sampleCreatedAtIso: candidate.sampleCreatedAtIso || null,
+      };
+    }
+  }
+  return best;
+};
+
 const assemblyModelsSupportingSpeakerIdentification = new Set(["universal-3-pro", "universal-2"]);
 
 const payloadAllowsSpeakerIdentification = (payload) => {
@@ -422,4 +468,5 @@ module.exports = {
   mergeAssemblyTranscriptPayload,
   formatDominantAssemblySpeakerLabel,
   pickSpeakerIdentificationMapping,
+  bestSpeakerMatchAgainstProfile,
 };

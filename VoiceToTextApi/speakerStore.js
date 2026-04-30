@@ -46,12 +46,22 @@ async function readFromFirestore() {
     return [];
   }
   const data = snap.data();
+  if (typeof data?.profilesJson === "string") {
+    const parsed = JSON.parse(data.profilesJson);
+    return Array.isArray(parsed) ? parsed : [];
+  }
   return Array.isArray(data?.profiles) ? data.profiles : [];
 }
 
 async function writeToFirestore(profiles) {
+  const { FieldValue } = require("firebase-admin/firestore");
   await speakerDocRef().set(
-    { profiles, updatedAt: new Date().toISOString() },
+    {
+      profilesJson: JSON.stringify(profiles),
+      profiles: FieldValue.delete(),
+      profileCount: Array.isArray(profiles) ? profiles.length : 0,
+      updatedAt: new Date().toISOString(),
+    },
     { merge: true },
   );
 }

@@ -9,6 +9,7 @@ const os = require("os");
 const { randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const speakerStore = require("./speakerStore");
+const historyStore = require("./historyStore");
 const voiceRecognition = require("./voiceRecognition");
 
 const app = express();
@@ -368,10 +369,32 @@ const extensionFromMime = (mimeType) => {
   return ".m4a";
 };
 
-const updateSpeakerProfile = async (speakerName, signature) => {
+const cleanEnrollmentSource = (value) => {
+  const source = typeof value === "string" ? value.trim() : "";
+  const allowed = new Set(["speaker_name_input", "unknown_speaker_prompt", "speaker_conflict_prompt"]);
+  return allowed.has(source) ? source : "speaker_name_input";
+};
+
+const buildEnrollmentSample = (speakerName, signature, metadata = {}) => {
+  const createdAtMs = Date.now();
+  const historyClientId =
+    typeof metadata.historyClientId === "string" ? metadata.historyClientId.trim().slice(0, 120) : "";
+  return {
+    sampleId: randomUUID(),
+    speakerName,
+    source: cleanEnrollmentSource(metadata.source),
+    createdAtMs,
+    createdAtIso: new Date(createdAtMs).toISOString(),
+    ...(historyClientId ? { historyClientId } : {}),
+    vector: [...signature],
+  };
+};
+
+const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
   const profiles = await speakerStore.readSpeakerProfiles();
   const sigCopy = [...signature];
   const existingIndex = profiles.findIndex((item) => item.name === speakerName);
+  const enrollmentSample = buildEnrollmentSample(speakerName, sigCopy, metadata);
   if (existingIndex >= 0) {
     const current = profiles[existingIndex];
     const total = (current.samples || 0) + 1;
@@ -382,12 +405,16 @@ const updateSpeakerProfile = async (speakerName, signature) => {
       ? current.vectorsRecent.filter((v) => Array.isArray(v) && v.length > 0).map((v) => [...v])
       : [];
     const nextRecent = [...prevRecent, sigCopy].slice(-speakerRecentVectorsMax);
+    const enrollmentSamples = Array.isArray(current.enrollmentSamples)
+      ? [...current.enrollmentSamples, enrollmentSample]
+      : [enrollmentSample];
     profiles[existingIndex] = {
       ...current,
       name: speakerName,
       samples: total,
       vector: alignedCurrent.map((value, index) => (value * (total - 1) + signature[index]) / total),
       vectorsRecent: nextRecent,
+      enrollmentSamples,
     };
   } else {
     profiles.push({
@@ -395,9 +422,42 @@ const updateSpeakerProfile = async (speakerName, signature) => {
       samples: 1,
       vector: signature,
       vectorsRecent: [sigCopy],
+      enrollmentSamples: [enrollmentSample],
     });
   }
   await speakerStore.writeSpeakerProfiles(profiles);
+};
+
+const publicEnrollmentSamples = (profile) =>
+  Array.isArray(profile?.enrollmentSamples)
+    ? profile.enrollmentSamples
+        .filter((sample) => sample && typeof sample === "object" && typeof sample.sampleId === "string")
+        .map((sample) => ({
+          sampleId: sample.sampleId,
+          source: typeof sample.source === "string" ? sample.source : "unknown",
+          createdAtMs: typeof sample.createdAtMs === "number" ? sample.createdAtMs : null,
+          createdAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
+          historyClientId: typeof sample.historyClientId === "string" ? sample.historyClientId : null,
+        }))
+    : [];
+
+const rebuildProfileFromEnrollmentSamples = (profile, enrollmentSamples) => {
+  const validSamples = enrollmentSamples.filter((sample) => Array.isArray(sample?.vector) && sample.vector.length > 0);
+  if (validSamples.length === 0) {
+    return null;
+  }
+  const dim = validSamples[0].vector.length;
+  const vectors = validSamples.map((sample) => voiceRecognition.padVoiceVector(sample.vector, dim, 0.5));
+  const vector = Array.from({ length: dim }, (_, index) =>
+    vectors.reduce((sum, item) => sum + item[index], 0) / vectors.length,
+  );
+  return {
+    ...profile,
+    samples: validSamples.length,
+    vector,
+    vectorsRecent: vectors.slice(-speakerRecentVectorsMax),
+    enrollmentSamples: validSamples,
+  };
 };
 
 const getSpeakerMatchRelaxedThreshold = () => {
@@ -428,11 +488,17 @@ const detectSpeakerName = async (signature) => {
   }
   const scored = [];
   for (const profile of profiles) {
-    const score = voiceRecognition.bestCosineScoreAgainstProfile(signature, profile);
-    if (score == null) {
+    const match = voiceRecognition.bestSpeakerMatchAgainstProfile(signature, profile);
+    if (!match || match.score == null) {
       continue;
     }
-    scored.push({ name: profile.name, score });
+    scored.push({
+      name: profile.name,
+      score: match.score,
+      sampleId: match.sampleId,
+      sampleSource: match.sampleSource,
+      sampleCreatedAtIso: match.sampleCreatedAtIso,
+    });
   }
   if (scored.length === 0) {
     return null;
@@ -475,6 +541,7 @@ app.get("/speakers", async (_req, res) => {
         return {
           name: profile.name,
           samples: profile.samples || 0,
+          enrollmentSamples: publicEnrollmentSamples(profile),
           ...(desc.trim() ? { description: desc.trim() } : {}),
         };
       }),
@@ -544,6 +611,89 @@ app.delete("/speakers", async (_req, res) => {
   }
 });
 
+app.delete("/speakers/:name", async (req, res) => {
+  try {
+    const rawName = typeof req.params?.name === "string" ? decodeURIComponent(req.params.name).trim() : "";
+    if (!rawName) {
+      return res.status(400).json({ error: "Missing speaker name." });
+    }
+    const profiles = await speakerStore.readSpeakerProfiles();
+    const key = rawName.toLowerCase();
+    const remaining = profiles.filter((item) => String(item.name || "").trim().toLowerCase() !== key);
+    if (remaining.length === profiles.length) {
+      return res.status(404).json({ error: "Speaker not found." });
+    }
+    await speakerStore.writeSpeakerProfiles(remaining);
+    return res.json({ ok: true, deletedSpeakerName: rawName });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not delete speaker profile.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.delete("/speakers/:name/samples/:sampleId", async (req, res) => {
+  try {
+    const rawName = typeof req.params?.name === "string" ? decodeURIComponent(req.params.name).trim() : "";
+    const sampleId =
+      typeof req.params?.sampleId === "string" ? decodeURIComponent(req.params.sampleId).trim() : "";
+    if (!rawName || !sampleId) {
+      return res.status(400).json({ error: "Missing speaker name or sample id." });
+    }
+
+    const profiles = await speakerStore.readSpeakerProfiles();
+    const key = rawName.toLowerCase();
+    const idx = profiles.findIndex((item) => String(item.name || "").trim().toLowerCase() === key);
+    if (idx < 0) {
+      return res.status(404).json({ error: "Speaker not found." });
+    }
+
+    const current = profiles[idx];
+    const enrollmentSamples = Array.isArray(current.enrollmentSamples) ? current.enrollmentSamples : [];
+    const remainingSamples = enrollmentSamples.filter((sample) => sample?.sampleId !== sampleId);
+    if (remainingSamples.length === enrollmentSamples.length) {
+      return res.status(404).json({ error: "Voice sample not found." });
+    }
+
+    const rebuilt = rebuildProfileFromEnrollmentSamples(current, remainingSamples);
+    if (rebuilt) {
+      profiles[idx] = rebuilt;
+    } else {
+      profiles.splice(idx, 1);
+    }
+    await speakerStore.writeSpeakerProfiles(profiles);
+    return res.json({
+      ok: true,
+      deletedSpeakerName: current.name,
+      deletedSampleId: sampleId,
+      remainingSamples: rebuilt?.samples || 0,
+      speakerDeleted: !rebuilt,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not delete voice sample.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.get("/history", async (req, res) => {
+  try {
+    const history = await historyStore.listHistoryEntries(req.query?.limit);
+    return res.json({ history });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not load transcript history.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/history", async (req, res) => {
+  try {
+    const saved = await historyStore.appendHistoryEntry(req.body || {});
+    return res.status(201).json({ ok: true, history: saved });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not save transcript history.";
+    return res.status(500).json({ error: message });
+  }
+});
+
 const executeTranscription = async (req, res, fileLike) => {
   try {
     if (!assemblyApiKey) {
@@ -576,7 +726,10 @@ const executeTranscription = async (req, res, fileLike) => {
       typeof req.body?.speakerName === "string" ? req.body.speakerName.trim() : "";
     const manualSpeakerName = speakerNameQuery || speakerNameHeader || manualSpeakerNameFromBody;
     if (manualSpeakerName) {
-      await updateSpeakerProfile(manualSpeakerName, voiceSignature);
+      await updateSpeakerProfile(manualSpeakerName, voiceSignature, {
+        source: req.body?.enrollmentSource || req.headers["x-enrollment-source"],
+        historyClientId: req.body?.historyClientId || req.headers["x-history-client-id"],
+      });
     }
     const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
 
@@ -698,7 +851,6 @@ const executeTranscription = async (req, res, fileLike) => {
     const utterances = Array.isArray(transcript.utterances) ? transcript.utterances : [];
     const dominantAssemblySpeakerLabel = voiceRecognition.formatDominantAssemblySpeakerLabel(utterances);
     const speakerIdentificationMapping = voiceRecognition.pickSpeakerIdentificationMapping(transcript);
-    const aiInsights = await buildAiInsights(transcriptText).catch(() => null);
 
     const speakerIdentificationCandidates =
       assemblySpeakers.length > 0 ? assemblySpeakers.map((s) => s.name) : knownSpeakerValues;
@@ -707,6 +859,9 @@ const executeTranscription = async (req, res, fileLike) => {
       text: transcriptText,
       detectedSpeakerName: detectedSpeaker?.name || null,
       speakerConfidence: detectedSpeaker?.score ?? null,
+      detectedSpeakerSampleId: detectedSpeaker?.sampleId || null,
+      detectedSpeakerSampleSource: detectedSpeaker?.sampleSource || null,
+      detectedSpeakerSampleCreatedAtIso: detectedSpeaker?.sampleCreatedAtIso || null,
       assemblySpeakerLabel: dominantAssemblySpeakerLabel,
       speakerIdentificationCandidates,
       speakerIdentificationMapping,
@@ -716,7 +871,6 @@ const executeTranscription = async (req, res, fileLike) => {
         start: item.start || 0,
         end: item.end || 0,
       })),
-      ai: aiInsights,
     });
   } catch (error) {
     const message =
