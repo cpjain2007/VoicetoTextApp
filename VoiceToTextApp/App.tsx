@@ -272,9 +272,7 @@ export default function App() {
   const [expandedHistorySpeakers, setExpandedHistorySpeakers] = useState<string[]>([]);
   const [expandedHistoryDateGroups, setExpandedHistoryDateGroups] = useState<string[]>([]);
   const [expandedSpeakerNames, setExpandedSpeakerNames] = useState<string[]>([]);
-  const [speakerName, setSpeakerName] = useState("");
   const [lastSpeakerName, setLastSpeakerName] = useState(UNKNOWN_SPEAKER_LABEL);
-  const [isEnrollMode, setIsEnrollMode] = useState(false);
   const [speakers, setSpeakers] = useState<SpeakerProfile[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
   const [speakerHintModal, setSpeakerHintModal] = useState<{ name: string; draft: string } | null>(null);
@@ -792,28 +790,14 @@ export default function App() {
           throw new Error("No recording file found.");
         }
 
-        const trimmedSpeakerName = speakerName.trim();
-        if (isEnrollMode && !trimmedSpeakerName) {
-          throw new Error("Enter a speaker name before recording in enroll mode.");
-        }
-
         const createdAtMs = Date.now();
         const historyClientId = `${createdAtMs}`;
-        const result = await transcribeAudio(uri, trimmedSpeakerName, {
-          enrollmentSource: trimmedSpeakerName ? "speaker_name_input" : undefined,
+        const result = await transcribeAudio(uri, "", {
           historyClientId,
         });
         const text = result.text;
-        const manualSpeakerName = result.enrolledSpeakerName || trimmedSpeakerName;
-        const typedSpeakerName = trimmedSpeakerName;
-        if (
-          typedSpeakerName &&
-          manualSpeakerName &&
-          typedSpeakerName !== manualSpeakerName &&
-          normalizeSpeakerKey(typedSpeakerName) === normalizeSpeakerKey(manualSpeakerName)
-        ) {
-          setSpeakerName(manualSpeakerName);
-        }
+        const manualSpeakerName = "";
+        const typedSpeakerName = "";
         let shouldRefreshSpeakers = !!manualSpeakerName;
         let voiceEnrollmentRequestFailed = false;
         /** Set when unknown-speaker flow successfully re-uploaded audio with a name (server enrollment). */
@@ -854,9 +838,6 @@ export default function App() {
               ? "voice_match"
               : "speaker_conflict_prompt";
           wasVoiceMatchUsed = speakerAttributionSource === "voice_match";
-          if (normalizeSpeakerKey(confirmed) !== normalizeSpeakerKey(typedSpeakerName)) {
-            setSpeakerName(confirmed);
-          }
         }
 
         if (isUnknownSpeakerLabel(normalizedSpeakerName)) {
@@ -868,7 +849,6 @@ export default function App() {
           normalizedSpeakerName = trimmedEntered || UNKNOWN_SPEAKER_LABEL;
           if (trimmedEntered) {
             speakerAttributionSource = "unknown_speaker_prompt";
-            setSpeakerName(trimmedEntered);
             try {
               setIsUploading(true);
               setStatusText("Saving voice profile…");
@@ -886,9 +866,7 @@ export default function App() {
                   ? enrollError.message
                   : "Voice profile could not be saved on the server.";
               setErrorText(enrollMessage);
-              setStatusText(
-                "Transcript saved locally. Enrollment failed — try recording again with the speaker name filled in.",
-              );
+              setStatusText("Transcript saved locally. Enrollment failed — try recording again.");
             } finally {
               setIsUploading(false);
             }
@@ -1174,24 +1152,9 @@ export default function App() {
 
         {activeTab === "record" ? (
           <View style={styles.tabContent}>
-            <Text style={styles.tabIntro}>Enter a speaker name only when you want to label or enroll this recording.</Text>
-            <TextInput
-              style={styles.speakerInput}
-              placeholder={isEnrollMode ? "Required in enroll mode (e.g. Alice)" : "Optional speaker name (e.g. Alice)"}
-              placeholderTextColor="#8f98bb"
-              value={speakerName}
-              onChangeText={setSpeakerName}
-              autoCapitalize="words"
-            />
-
-            <Pressable
-              style={styles.nextSpeakerButton}
-              onPress={() => setIsEnrollMode((current) => !current)}
-            >
-              <Text style={styles.nextSpeakerButtonText}>
-                {isEnrollMode ? "Enroll Mode: ON" : "Enroll Mode: OFF"}
-              </Text>
-            </Pressable>
+            <Text style={styles.tabIntro}>
+              Start recording to auto-detect the speaker. If no enrolled voice matches, the app will ask who was speaking.
+            </Text>
 
             <Pressable
               style={[styles.recordButton, isBusy && styles.recordButtonActive]}
@@ -1499,31 +1462,6 @@ const styles = StyleSheet.create({
   },
   tabPanel: {
     marginTop: 2,
-  },
-  speakerInput: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#3c4d8d",
-    color: "#f0f4ff",
-    backgroundColor: "#101834",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 10,
-    fontSize: 14,
-  },
-  nextSpeakerButton: {
-    marginBottom: 10,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#4e5fa9",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 10,
-  },
-  nextSpeakerButtonText: {
-    color: "#d7deff",
-    fontSize: 13,
-    fontWeight: "600",
   },
   speakerActionsRow: {
     flexDirection: "row",
