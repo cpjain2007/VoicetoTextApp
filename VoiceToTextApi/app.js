@@ -24,14 +24,15 @@ const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,
   .map((item) => item.trim())
   .filter(Boolean);
 /** Higher = fewer wrong-speaker IDs; lower if the same person is often missed. */
-const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.97");
-const speakerMatchMargin = Number(process.env.SPEAKER_MATCH_MARGIN || "0.05");
+const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.95");
+const speakerMatchMargin = Number(process.env.SPEAKER_MATCH_MARGIN || "0.04");
 const speakerMatchRelaxedEnabled = ["true", "1", "yes"].includes(
-  (process.env.SPEAKER_MATCH_RELAXED_ENABLED || "").trim().toLowerCase(),
+  (process.env.SPEAKER_MATCH_RELAXED_ENABLED || "true").trim().toLowerCase(),
 );
 /** If the runner-up is still “strong”, require at least this cosine gap (reduces confused twins / similar voices). */
-const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.035");
+const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.025");
 const speakerMatchSecondStrongMin = Number(process.env.SPEAKER_MATCH_SECOND_STRONG_MIN || "0.84");
+const speakerMatchHighConfidenceOverride = Number(process.env.SPEAKER_MATCH_HIGH_CONFIDENCE_OVERRIDE || "0.995");
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
@@ -375,6 +376,8 @@ const cleanEnrollmentSource = (value) => {
   return allowed.has(source) ? source : "speaker_name_input";
 };
 
+const speakerNameKey = (value) => String(value || "").trim().toLowerCase();
+
 const buildEnrollmentSample = (speakerName, signature, metadata = {}) => {
   const createdAtMs = Date.now();
   const historyClientId =
@@ -391,12 +394,16 @@ const buildEnrollmentSample = (speakerName, signature, metadata = {}) => {
 };
 
 const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
-  const profiles = await speakerStore.readSpeakerProfiles();
+  const profiles = await readSpeakerProfilesMerged();
   const sigCopy = [...signature];
-  const existingIndex = profiles.findIndex((item) => item.name === speakerName);
-  const enrollmentSample = buildEnrollmentSample(speakerName, sigCopy, metadata);
+  const displaySpeakerName = speakerName.trim();
+  const existingIndex = profiles.findIndex((item) => speakerNameKey(item.name) === speakerNameKey(displaySpeakerName));
+  let savedSpeakerName = displaySpeakerName;
   if (existingIndex >= 0) {
     const current = profiles[existingIndex];
+    const storedSpeakerName = typeof current.name === "string" && current.name.trim() ? current.name.trim() : displaySpeakerName;
+    savedSpeakerName = storedSpeakerName;
+    const enrollmentSample = buildEnrollmentSample(storedSpeakerName, sigCopy, metadata);
     const total = (current.samples || 0) + 1;
     const currentVector =
       Array.isArray(current.vector) && current.vector.length > 0 ? current.vector : signature.map(() => 0);
@@ -410,15 +417,16 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
       : [enrollmentSample];
     profiles[existingIndex] = {
       ...current,
-      name: speakerName,
+      name: storedSpeakerName,
       samples: total,
       vector: alignedCurrent.map((value, index) => (value * (total - 1) + signature[index]) / total),
       vectorsRecent: nextRecent,
       enrollmentSamples,
     };
   } else {
+    const enrollmentSample = buildEnrollmentSample(displaySpeakerName, sigCopy, metadata);
     profiles.push({
-      name: speakerName,
+      name: displaySpeakerName,
       samples: 1,
       vector: signature,
       vectorsRecent: [sigCopy],
@@ -426,6 +434,7 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
     });
   }
   await speakerStore.writeSpeakerProfiles(profiles);
+  return savedSpeakerName;
 };
 
 const publicEnrollmentSamples = (profile) =>
@@ -460,6 +469,110 @@ const rebuildProfileFromEnrollmentSamples = (profile, enrollmentSamples) => {
   };
 };
 
+const mergeEnrollmentSamples = (a = [], b = []) => {
+  const byId = new Map();
+  for (const sample of [...a, ...b]) {
+    if (!sample || typeof sample !== "object") {
+      continue;
+    }
+    const id = typeof sample.sampleId === "string" && sample.sampleId.trim() ? sample.sampleId : randomUUID();
+    byId.set(id, { ...sample, sampleId: id });
+  }
+  return [...byId.values()].sort((left, right) => {
+    const leftTime = typeof left.createdAtMs === "number" ? left.createdAtMs : 0;
+    const rightTime = typeof right.createdAtMs === "number" ? right.createdAtMs : 0;
+    return leftTime - rightTime;
+  });
+};
+
+const mergeSpeakerProfilePair = (base, incoming) => {
+  const baseSamples = Math.max(Number(base.samples) || 0, 0);
+  const incomingSamples = Math.max(Number(incoming.samples) || 0, 0);
+  const totalSamples = baseSamples + incomingSamples || 1;
+  const dim = Math.max(
+    Array.isArray(base.vector) ? base.vector.length : 0,
+    Array.isArray(incoming.vector) ? incoming.vector.length : 0,
+  );
+  const baseVector = dim > 0 ? voiceRecognition.padVoiceVector(base.vector || [], dim, 0.5) : [];
+  const incomingVector = dim > 0 ? voiceRecognition.padVoiceVector(incoming.vector || [], dim, 0.5) : [];
+  const enrollmentSamples = mergeEnrollmentSamples(base.enrollmentSamples, incoming.enrollmentSamples);
+  const vectorsRecent = [
+    ...(Array.isArray(base.vectorsRecent) ? base.vectorsRecent : []),
+    ...(Array.isArray(incoming.vectorsRecent) ? incoming.vectorsRecent : []),
+  ]
+    .filter((vector) => Array.isArray(vector) && vector.length > 0)
+    .slice(-speakerRecentVectorsMax);
+  const speakerDescription =
+    typeof base.speakerDescription === "string" && base.speakerDescription.trim()
+      ? base.speakerDescription
+      : typeof incoming.speakerDescription === "string" && incoming.speakerDescription.trim()
+        ? incoming.speakerDescription
+        : undefined;
+  const description =
+    typeof base.description === "string" && base.description.trim()
+      ? base.description
+      : typeof incoming.description === "string" && incoming.description.trim()
+        ? incoming.description
+        : undefined;
+
+  return {
+    ...base,
+    name: typeof base.name === "string" && base.name.trim() ? base.name.trim() : incoming.name,
+    samples: totalSamples,
+    ...(dim > 0
+      ? {
+          vector: baseVector.map(
+            (value, index) => (value * baseSamples + incomingVector[index] * incomingSamples) / totalSamples,
+          ),
+        }
+      : {}),
+    ...(vectorsRecent.length > 0 ? { vectorsRecent } : {}),
+    ...(enrollmentSamples.length > 0 ? { enrollmentSamples } : {}),
+    ...(speakerDescription ? { speakerDescription } : {}),
+    ...(description ? { description } : {}),
+  };
+};
+
+const mergeSpeakerProfilesByName = (profiles) => {
+  const merged = [];
+  const byName = new Map();
+  let changed = false;
+
+  for (const profile of Array.isArray(profiles) ? profiles : []) {
+    const key = speakerNameKey(profile?.name);
+    if (!key) {
+      changed = true;
+      continue;
+    }
+
+    const cleanProfile = {
+      ...profile,
+      name: String(profile.name).trim(),
+    };
+    const existingIndex = byName.get(key);
+    if (existingIndex === undefined) {
+      byName.set(key, merged.length);
+      merged.push(cleanProfile);
+      changed = changed || cleanProfile.name !== profile.name;
+      continue;
+    }
+
+    merged[existingIndex] = mergeSpeakerProfilePair(merged[existingIndex], cleanProfile);
+    changed = true;
+  }
+
+  return { profiles: merged, changed };
+};
+
+const readSpeakerProfilesMerged = async () => {
+  const profiles = await speakerStore.readSpeakerProfiles();
+  const merged = mergeSpeakerProfilesByName(profiles);
+  if (merged.changed) {
+    await speakerStore.writeSpeakerProfiles(merged.profiles);
+  }
+  return merged.profiles;
+};
+
 const getSpeakerMatchRelaxedThreshold = () => {
   const raw = typeof process.env.SPEAKER_MATCH_RELAXED_THRESHOLD === "string" ? process.env.SPEAKER_MATCH_RELAXED_THRESHOLD.trim() : "";
   if (raw) {
@@ -468,11 +581,14 @@ const getSpeakerMatchRelaxedThreshold = () => {
       return Math.min(Math.max(parsed, 0.75), 0.995);
     }
   }
-  return Math.max(0.82, speakerSimilarityThreshold - 0.04);
+  return Math.max(0.86, speakerSimilarityThreshold - 0.08);
 };
 
 const isAmbiguousSpeakerPair = (best, second) => {
   if (!second) {
+    return false;
+  }
+  if (best.score >= speakerMatchHighConfidenceOverride && best.score > second.score) {
     return false;
   }
   if (second.score < speakerMatchSecondStrongMin) {
@@ -482,7 +598,7 @@ const isAmbiguousSpeakerPair = (best, second) => {
 };
 
 const detectSpeakerName = async (signature) => {
-  const profiles = await speakerStore.readSpeakerProfiles();
+  const profiles = await readSpeakerProfilesMerged();
   if (profiles.length === 0) {
     return null;
   }
@@ -506,6 +622,14 @@ const detectSpeakerName = async (signature) => {
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0];
   const second = scored[1];
+  console.log("Speaker match candidates", {
+    best: best ? { name: best.name, score: Number(best.score.toFixed(4)), sampleSource: best.sampleSource } : null,
+    second: second ? { name: second.name, score: Number(second.score.toFixed(4)) } : null,
+    threshold: speakerSimilarityThreshold,
+    relaxedEnabled: speakerMatchRelaxedEnabled,
+    relaxedThreshold: getSpeakerMatchRelaxedThreshold(),
+    highConfidenceOverride: speakerMatchHighConfidenceOverride,
+  });
   if (isAmbiguousSpeakerPair(best, second)) {
     return null;
   }
@@ -529,7 +653,7 @@ app.get("/health", (_req, res) => {
 
 app.get("/speakers", async (_req, res) => {
   try {
-    const profiles = await speakerStore.readSpeakerProfiles();
+    const profiles = await readSpeakerProfilesMerged();
     return res.json({
       speakers: profiles.map((profile) => {
         const desc =
@@ -562,7 +686,7 @@ app.patch("/speakers", async (req, res) => {
       typeof req.body?.speakerDescription === "string" ? req.body.speakerDescription : "";
     const speakerDescription = String(rawDesc).trim().slice(0, assemblySpeakerDescriptionMaxLen);
 
-    const profiles = await speakerStore.readSpeakerProfiles();
+    const profiles = await readSpeakerProfilesMerged();
     const key = rawName.toLowerCase();
     const idx = profiles.findIndex((item) => String(item.name || "").trim().toLowerCase() === key);
     if (idx < 0) {
@@ -617,7 +741,7 @@ app.delete("/speakers/:name", async (req, res) => {
     if (!rawName) {
       return res.status(400).json({ error: "Missing speaker name." });
     }
-    const profiles = await speakerStore.readSpeakerProfiles();
+    const profiles = await readSpeakerProfilesMerged();
     const key = rawName.toLowerCase();
     const remaining = profiles.filter((item) => String(item.name || "").trim().toLowerCase() !== key);
     if (remaining.length === profiles.length) {
@@ -640,7 +764,7 @@ app.delete("/speakers/:name/samples/:sampleId", async (req, res) => {
       return res.status(400).json({ error: "Missing speaker name or sample id." });
     }
 
-    const profiles = await speakerStore.readSpeakerProfiles();
+    const profiles = await readSpeakerProfilesMerged();
     const key = rawName.toLowerCase();
     const idx = profiles.findIndex((item) => String(item.name || "").trim().toLowerCase() === key);
     if (idx < 0) {
@@ -725,30 +849,31 @@ const executeTranscription = async (req, res, fileLike) => {
     const manualSpeakerNameFromBody =
       typeof req.body?.speakerName === "string" ? req.body.speakerName.trim() : "";
     const manualSpeakerName = speakerNameQuery || speakerNameHeader || manualSpeakerNameFromBody;
+    let enrolledSpeakerName = null;
     if (manualSpeakerName) {
-      await updateSpeakerProfile(manualSpeakerName, voiceSignature, {
+      enrolledSpeakerName = await updateSpeakerProfile(manualSpeakerName, voiceSignature, {
         source: req.body?.enrollmentSource || req.headers["x-enrollment-source"],
         historyClientId: req.body?.historyClientId || req.headers["x-history-client-id"],
       });
     }
     const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
 
-    const profilesForIdentification = await speakerStore.readSpeakerProfiles();
+    const profilesForIdentification = await readSpeakerProfilesMerged();
     const knownSpeakerValues = voiceRecognition.prioritizeSpeakerNameInKnownList(
       voiceRecognition.buildKnownSpeakerValuesForIdentification(
         profilesForIdentification,
-        manualSpeakerName,
+        enrolledSpeakerName || manualSpeakerName,
         { maxNames: assemblyKnownSpeakersMax, nameMaxLen: assemblySpeakerNameMaxLen },
       ),
-      manualSpeakerName,
+      enrolledSpeakerName || manualSpeakerName,
     );
     const assemblySpeakers = voiceRecognition.prioritizeManualSpeakerFirstSpeakers(
-      voiceRecognition.profilesToAssemblySpeakers(profilesForIdentification, manualSpeakerName, {
+      voiceRecognition.profilesToAssemblySpeakers(profilesForIdentification, enrolledSpeakerName || manualSpeakerName, {
         maxNames: assemblyKnownSpeakersMax,
         nameMaxLen: assemblySpeakerNameMaxLen,
         descriptionMaxLen: assemblySpeakerDescriptionMaxLen,
       }),
-      manualSpeakerName,
+      enrolledSpeakerName || manualSpeakerName,
     );
     const speechUnderstandingBlock =
       voiceRecognition.buildSpeechUnderstandingSpeakerIdentificationFromSpeakers(
@@ -857,6 +982,7 @@ const executeTranscription = async (req, res, fileLike) => {
 
     return res.json({
       text: transcriptText,
+      enrolledSpeakerName,
       detectedSpeakerName: detectedSpeaker?.name || null,
       speakerConfidence: detectedSpeaker?.score ?? null,
       detectedSpeakerSampleId: detectedSpeaker?.sampleId || null,
