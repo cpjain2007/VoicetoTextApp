@@ -182,6 +182,25 @@ describe("bestCosineScoreAgainstProfile", () => {
   });
 });
 
+describe("bestSpeakerMatchAgainstProfile", () => {
+  it("considers aggregate profile vectors even when enrollment samples exist", () => {
+    const sig = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const profile = {
+      vector: sig,
+      enrollmentSamples: [
+        {
+          sampleId: "sample-low",
+          source: "speaker_name_input",
+          vector: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+      ],
+    };
+    const match = voiceRecognition.bestSpeakerMatchAgainstProfile(sig, profile);
+    assert.equal(match.score, 1);
+    assert.equal(match.sampleSource, "aggregate_profile");
+  });
+});
+
 describe("buildKnownSpeakerValuesForIdentification", () => {
   it("dedupes case-insensitively and includes manual name", () => {
     const profiles = [{ name: "Alice" }, { name: "  alice  " }, { name: "Bob" }];

@@ -353,28 +353,40 @@ const bestSpeakerMatchAgainstProfile = (signature, profile) => {
   }
   const dim = signature.length;
   const candidates = [];
+  const seenVectors = new Set();
+  const addCandidate = (rawVector, metadata = {}) => {
+    if (!Array.isArray(rawVector) || rawVector.length === 0) {
+      return;
+    }
+    const vector = padVoiceVector(rawVector, dim, 0.5);
+    const key = vector.join(",");
+    if (seenVectors.has(key)) {
+      return;
+    }
+    seenVectors.add(key);
+    candidates.push({ vector, ...metadata });
+  };
+
   if (Array.isArray(profile?.enrollmentSamples)) {
     for (const sample of profile.enrollmentSamples) {
-      if (Array.isArray(sample?.vector) && sample.vector.length > 0) {
-        candidates.push({
-          vector: padVoiceVector(sample.vector, dim, 0.5),
-          sampleId: typeof sample.sampleId === "string" ? sample.sampleId : null,
-          sampleSource: typeof sample.source === "string" ? sample.source : null,
-          sampleCreatedAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
-        });
-      }
+      addCandidate(sample?.vector, {
+        sampleId: typeof sample?.sampleId === "string" ? sample.sampleId : null,
+        sampleSource: typeof sample?.source === "string" ? sample.source : null,
+        sampleCreatedAtIso: typeof sample?.createdAtIso === "string" ? sample.createdAtIso : null,
+      });
     }
   }
-  if (candidates.length === 0 && Array.isArray(profile?.vector) && profile.vector.length > 0) {
-    candidates.push({ vector: padVoiceVector(profile.vector, dim, 0.5) });
+
+  if (Array.isArray(profile?.vector) && profile.vector.length > 0) {
+    addCandidate(profile.vector, { sampleSource: "aggregate_profile" });
   }
-  if (candidates.length === 0 && Array.isArray(profile?.vectorsRecent)) {
+
+  if (Array.isArray(profile?.vectorsRecent)) {
     for (const v of profile.vectorsRecent) {
-      if (Array.isArray(v) && v.length > 0) {
-        candidates.push({ vector: padVoiceVector(v, dim, 0.5) });
-      }
+      addCandidate(v, { sampleSource: "recent_profile" });
     }
   }
+
   if (candidates.length === 0) {
     return null;
   }

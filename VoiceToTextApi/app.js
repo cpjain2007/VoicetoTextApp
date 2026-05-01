@@ -24,14 +24,15 @@ const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,
   .map((item) => item.trim())
   .filter(Boolean);
 /** Higher = fewer wrong-speaker IDs; lower if the same person is often missed. */
-const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.97");
-const speakerMatchMargin = Number(process.env.SPEAKER_MATCH_MARGIN || "0.05");
+const speakerSimilarityThreshold = Number(process.env.SPEAKER_MATCH_THRESHOLD || "0.95");
+const speakerMatchMargin = Number(process.env.SPEAKER_MATCH_MARGIN || "0.04");
 const speakerMatchRelaxedEnabled = ["true", "1", "yes"].includes(
-  (process.env.SPEAKER_MATCH_RELAXED_ENABLED || "").trim().toLowerCase(),
+  (process.env.SPEAKER_MATCH_RELAXED_ENABLED || "true").trim().toLowerCase(),
 );
 /** If the runner-up is still “strong”, require at least this cosine gap (reduces confused twins / similar voices). */
-const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.035");
+const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.025");
 const speakerMatchSecondStrongMin = Number(process.env.SPEAKER_MATCH_SECOND_STRONG_MIN || "0.84");
+const speakerMatchHighConfidenceOverride = Number(process.env.SPEAKER_MATCH_HIGH_CONFIDENCE_OVERRIDE || "0.995");
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
@@ -580,11 +581,14 @@ const getSpeakerMatchRelaxedThreshold = () => {
       return Math.min(Math.max(parsed, 0.75), 0.995);
     }
   }
-  return Math.max(0.82, speakerSimilarityThreshold - 0.04);
+  return Math.max(0.86, speakerSimilarityThreshold - 0.08);
 };
 
 const isAmbiguousSpeakerPair = (best, second) => {
   if (!second) {
+    return false;
+  }
+  if (best.score >= speakerMatchHighConfidenceOverride && best.score > second.score) {
     return false;
   }
   if (second.score < speakerMatchSecondStrongMin) {
@@ -618,6 +622,14 @@ const detectSpeakerName = async (signature) => {
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0];
   const second = scored[1];
+  console.log("Speaker match candidates", {
+    best: best ? { name: best.name, score: Number(best.score.toFixed(4)), sampleSource: best.sampleSource } : null,
+    second: second ? { name: second.name, score: Number(second.score.toFixed(4)) } : null,
+    threshold: speakerSimilarityThreshold,
+    relaxedEnabled: speakerMatchRelaxedEnabled,
+    relaxedThreshold: getSpeakerMatchRelaxedThreshold(),
+    highConfidenceOverride: speakerMatchHighConfidenceOverride,
+  });
   if (isAmbiguousSpeakerPair(best, second)) {
     return null;
   }
