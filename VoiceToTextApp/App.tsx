@@ -42,6 +42,7 @@ type TranscriptLogItem = {
 
 type TranscriptionResult = {
   text: string;
+  enrolledSpeakerName: string | null;
   detectedSpeakerName: string | null;
   speakerConfidence: number | null;
   detectedSpeakerSampleId: string | null;
@@ -132,6 +133,18 @@ const formatSampleTime = (sample: EnrollmentSample) => {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+  });
+};
+
+const formatHistoryDateGroup = (timestampMs: number) => {
+  if (!Number.isFinite(timestampMs)) {
+    return "Unknown date";
+  }
+  return new Date(timestampMs).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
   });
 };
 
@@ -256,6 +269,9 @@ export default function App() {
   const [history, setHistory] = useState<TranscriptLogItem[]>([]);
   const [activeTab, setActiveTab] = useState<AppTab>("record");
   const [expandedHistoryIds, setExpandedHistoryIds] = useState<string[]>([]);
+  const [expandedHistorySpeakers, setExpandedHistorySpeakers] = useState<string[]>([]);
+  const [expandedHistoryDateGroups, setExpandedHistoryDateGroups] = useState<string[]>([]);
+  const [expandedSpeakerNames, setExpandedSpeakerNames] = useState<string[]>([]);
   const [speakerName, setSpeakerName] = useState("");
   const [lastSpeakerName, setLastSpeakerName] = useState(UNKNOWN_SPEAKER_LABEL);
   const [isEnrollMode, setIsEnrollMode] = useState(false);
@@ -270,6 +286,7 @@ export default function App() {
   const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.97");
 
   const unknownSpeakerResolveRef = useRef<((value: string) => void) | null>(null);
+  const lastAutoExpandedHistoryIdRef = useRef<string | null>(null);
   const [unknownSpeakerModalVisible, setUnknownSpeakerModalVisible] = useState(false);
   const [unknownSpeakerDraft, setUnknownSpeakerDraft] = useState("");
 
@@ -382,6 +399,7 @@ export default function App() {
     const data = JSON.parse(responseBody) as {
       text?: string;
       transcript?: string;
+      enrolledSpeakerName?: string | null;
       detectedSpeakerName?: string | null;
       speakerConfidence?: number | null;
       detectedSpeakerSampleId?: string | null;
@@ -393,6 +411,7 @@ export default function App() {
     };
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",
+      enrolledSpeakerName: data.enrolledSpeakerName?.trim() || null,
       detectedSpeakerName: data.detectedSpeakerName?.trim() || null,
       speakerConfidence: typeof data.speakerConfidence === "number" ? data.speakerConfidence : null,
       detectedSpeakerSampleId:
@@ -649,6 +668,30 @@ export default function App() {
     );
   };
 
+  const toggleHistorySpeakerExpanded = (speakerName: string) => {
+    setExpandedHistorySpeakers((current) =>
+      current.includes(speakerName)
+        ? current.filter((name) => name !== speakerName)
+        : [...current, speakerName],
+    );
+  };
+
+  const toggleHistoryDateExpanded = (dateGroupKey: string) => {
+    setExpandedHistoryDateGroups((current) =>
+      current.includes(dateGroupKey)
+        ? current.filter((key) => key !== dateGroupKey)
+        : [...current, dateGroupKey],
+    );
+  };
+
+  const toggleSpeakerSamplesExpanded = (speakerName: string) => {
+    setExpandedSpeakerNames((current) =>
+      current.includes(speakerName)
+        ? current.filter((name) => name !== speakerName)
+        : [...current, speakerName],
+    );
+  };
+
   const deleteVoiceSample = (speakerName: string, sampleId: string) => {
     Alert.alert(
       "Delete Voice Sample?",
@@ -761,7 +804,16 @@ export default function App() {
           historyClientId,
         });
         const text = result.text;
-        const manualSpeakerName = trimmedSpeakerName;
+        const manualSpeakerName = result.enrolledSpeakerName || trimmedSpeakerName;
+        const typedSpeakerName = trimmedSpeakerName;
+        if (
+          typedSpeakerName &&
+          manualSpeakerName &&
+          typedSpeakerName !== manualSpeakerName &&
+          normalizeSpeakerKey(typedSpeakerName) === normalizeSpeakerKey(manualSpeakerName)
+        ) {
+          setSpeakerName(manualSpeakerName);
+        }
         let shouldRefreshSpeakers = !!manualSpeakerName;
         let voiceEnrollmentRequestFailed = false;
         /** Set when unknown-speaker flow successfully re-uploaded audio with a name (server enrollment). */
@@ -802,7 +854,7 @@ export default function App() {
               ? "voice_match"
               : "speaker_conflict_prompt";
           wasVoiceMatchUsed = speakerAttributionSource === "voice_match";
-          if (normalizeSpeakerKey(confirmed) !== normalizeSpeakerKey(manualSpeakerName)) {
+          if (normalizeSpeakerKey(confirmed) !== normalizeSpeakerKey(typedSpeakerName)) {
             setSpeakerName(confirmed);
           }
         }
@@ -820,12 +872,13 @@ export default function App() {
             try {
               setIsUploading(true);
               setStatusText("Saving voice profile…");
-              await transcribeAudio(uri, trimmedEntered, {
+              const enrollmentResult = await transcribeAudio(uri, trimmedEntered, {
                 enrollmentSource: "unknown_speaker_prompt",
                 historyClientId,
               });
               shouldRefreshSpeakers = true;
-              enrolledVoiceAsName = trimmedEntered;
+              enrolledVoiceAsName = enrollmentResult.enrolledSpeakerName || trimmedEntered;
+              normalizedSpeakerName = enrolledVoiceAsName;
             } catch (enrollError) {
               voiceEnrollmentRequestFailed = true;
               const enrollMessage =
@@ -851,7 +904,7 @@ export default function App() {
           createdAt: createTimeLabel(createdAtMs),
           createdAtMs,
           speakerAttributionSource,
-          speakerNameInput: manualSpeakerName || null,
+          speakerNameInput: typedSpeakerName || null,
           promptedSpeakerName,
           detectedSpeakerName: result.detectedSpeakerName,
           speakerConfidence: result.speakerConfidence,
@@ -859,11 +912,11 @@ export default function App() {
           matchedEnrollmentSampleSource: result.detectedSpeakerSampleSource,
           matchedEnrollmentSampleCreatedAtIso: result.detectedSpeakerSampleCreatedAtIso,
           assemblySpeakerLabel: result.assemblySpeakerLabel,
-          wasSpeakerNameInputProvided: !!manualSpeakerName,
+          wasSpeakerNameInputProvided: !!typedSpeakerName,
           wasUnknownSpeakerPromptShown,
           wasVoiceMatchUsed,
           wasConflictPromptShown,
-          wasVoiceProfileEnrolled: !!enrolledVoiceAsName || (!!manualSpeakerName && !voiceEnrollmentRequestFailed),
+          wasVoiceProfileEnrolled: !!enrolledVoiceAsName || (!!typedSpeakerName && !voiceEnrollmentRequestFailed),
         };
         const nextHistory = [newHistoryEntry, ...history];
         setHistory((current) => [
@@ -921,20 +974,52 @@ export default function App() {
     }
   };
 
+  const latestHistoryItem = useMemo(() => {
+    const latest = history.reduce<TranscriptLogItem | null>(
+      (currentLatest, item) =>
+        !currentLatest || (item.createdAtMs || 0) > (currentLatest.createdAtMs || 0)
+          ? item
+          : currentLatest,
+      null,
+    );
+    return latest;
+  }, [history]);
+
+  useEffect(() => {
+    if (!latestHistoryItem || lastAutoExpandedHistoryIdRef.current === latestHistoryItem.id) {
+      return;
+    }
+    const speakerName = latestHistoryItem.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
+    const dateLabel = formatHistoryDateGroup(latestHistoryItem.createdAtMs);
+    const dateGroupKey = `${speakerName}:${dateLabel}`;
+
+    lastAutoExpandedHistoryIdRef.current = latestHistoryItem.id;
+    setExpandedHistorySpeakers([speakerName]);
+    setExpandedHistoryDateGroups([dateGroupKey]);
+    setExpandedHistoryIds([latestHistoryItem.id]);
+  }, [latestHistoryItem]);
+
   const groupedHistory = useMemo(() => {
-    const groups = new Map<string, TranscriptLogItem[]>();
+    const groups = new Map<string, Map<string, TranscriptLogItem[]>>();
     history.forEach((item) => {
-      const bucket = item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
-      const existing = groups.get(bucket) || [];
-      existing.push(item);
-      groups.set(bucket, existing);
+      const speakerName = item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
+      const dateLabel = formatHistoryDateGroup(item.createdAtMs);
+      const dateGroups = groups.get(speakerName) || new Map<string, TranscriptLogItem[]>();
+      const existing = dateGroups.get(dateLabel) || [];
+      dateGroups.set(dateLabel, [...existing, item]);
+      groups.set(speakerName, dateGroups);
     });
     return Array.from(groups.entries())
-      .map(([speaker, items]) => [
+      .map(([speaker, dateGroups]) => [
         speaker,
-        [...items].sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0)),
+        Array.from(dateGroups.entries())
+          .map(([dateLabel, items]) => [
+            dateLabel,
+            [...items].sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0)),
+          ] as const)
+          .sort(([, aItems], [, bItems]) => (bItems[0]?.createdAtMs || 0) - (aItems[0]?.createdAtMs || 0)),
       ] as const)
-      .sort(([, aItems], [, bItems]) => (bItems[0]?.createdAtMs || 0) - (aItems[0]?.createdAtMs || 0));
+      .sort(([, aDates], [, bDates]) => (bDates[0]?.[1][0]?.createdAtMs || 0) - (aDates[0]?.[1][0]?.createdAtMs || 0));
   }, [history]);
 
   return (
@@ -1147,53 +1232,91 @@ export default function App() {
               {history.length === 0 ? (
                 <Text style={styles.historyEmptyText}>No transcriptions logged yet.</Text>
               ) : (
-                groupedHistory.map(([groupTitle, items]) => (
-                  <View key={groupTitle} style={styles.historyGroup}>
-                    <Text style={styles.historyGroupTitle}>
-                      {groupTitle} ({items.length})
-                    </Text>
-                    {items.map((item) => (
-                      <View key={item.id} style={styles.historyItem}>
-                        <Pressable
-                          style={styles.historySpeakerRow}
-                          onPress={() => toggleHistoryItemExpanded(item.id)}
-                        >
-                          <Text style={styles.historySpeaker}>{item.createdAt}</Text>
-                          <Text style={styles.historyExpandHint}>
-                            {expandedHistoryIds.includes(item.id) ? "Hide" : "View"}
-                          </Text>
-                        </Pressable>
-                        {expandedHistoryIds.includes(item.id) ? (
-                          <View style={styles.historyDetailsBox}>
-                            <View style={styles.historyMetaRow}>
-                              <Text style={styles.historyTimestamp}>{item.createdAt}</Text>
+                groupedHistory.map(([speakerName, dateGroups]) => (
+                  <View key={speakerName} style={styles.historyGroup}>
+                    <Pressable
+                      style={styles.historyGroupTitleRow}
+                      onPress={() => toggleHistorySpeakerExpanded(speakerName)}
+                    >
+                      <Text style={styles.historyGroupTitle}>
+                        {speakerName} ({dateGroups.reduce((sum, [, items]) => sum + items.length, 0)})
+                      </Text>
+                      <Text style={styles.historyExpandHint}>
+                        {expandedHistorySpeakers.includes(speakerName) ? "Hide" : "View"}
+                      </Text>
+                    </Pressable>
+                    {expandedHistorySpeakers.includes(speakerName)
+                      ? dateGroups.map(([dateLabel, items]) => {
+                          const dateGroupKey = `${speakerName}:${dateLabel}`;
+                          const isDateExpanded = expandedHistoryDateGroups.includes(dateGroupKey);
+
+                          return (
+                            <View key={dateGroupKey} style={styles.historyDateGroup}>
                               <Pressable
-                                style={styles.deleteLogButton}
-                                onPress={() => confirmDeleteHistoryItem(item.id)}
+                                style={styles.historyDateGroupTitleRow}
+                                onPress={() => toggleHistoryDateExpanded(dateGroupKey)}
                               >
-                                <Text style={styles.deleteLogButtonText}>Delete</Text>
+                                <Text style={styles.historyDateGroupTitle}>
+                                  {dateLabel} ({items.length})
+                                </Text>
+                                <Text style={styles.historyExpandHint}>
+                                  {isDateExpanded ? "Hide" : "View"}
+                                </Text>
                               </Pressable>
+                              {isDateExpanded
+                                ? items.map((item) => (
+                                    <View key={item.id} style={styles.historyItem}>
+                                      <Pressable
+                                        style={styles.historySpeakerRow}
+                                        onPress={() => toggleHistoryItemExpanded(item.id)}
+                                      >
+                                        <Text style={styles.historySpeaker}>{item.createdAt}</Text>
+                                        <Text style={styles.historyExpandHint}>
+                                          {expandedHistoryIds.includes(item.id) ? "Hide" : "View"}
+                                        </Text>
+                                      </Pressable>
+                                      {expandedHistoryIds.includes(item.id) ? (
+                                        <View style={styles.historyDetailsBox}>
+                                          <View style={styles.historyMetaRow}>
+                                            <Text style={styles.historyTimestamp}>{item.createdAt}</Text>
+                                            <Pressable
+                                              style={styles.deleteLogButton}
+                                              onPress={() => confirmDeleteHistoryItem(item.id)}
+                                            >
+                                              <Text style={styles.deleteLogButtonText}>Delete</Text>
+                                            </Pressable>
+                                          </View>
+                                          <Text style={styles.historyAttribution}>
+                                            Source: {formatAttributionSource(item.speakerAttributionSource)}
+                                            {typeof item.speakerConfidence === "number"
+                                              ? ` • Confidence: ${(item.speakerConfidence * 100).toFixed(0)}%`
+                                              : ""}
+                                          </Text>
+                                          {item.speakerNameInput ? (
+                                            <Text style={styles.historyAttribution}>
+                                              Typed name: {item.speakerNameInput}
+                                            </Text>
+                                          ) : null}
+                                          {item.promptedSpeakerName ? (
+                                            <Text style={styles.historyAttribution}>
+                                              Prompted name: {item.promptedSpeakerName}
+                                            </Text>
+                                          ) : null}
+                                          <Text style={styles.historyAttribution}>
+                                            Matched sample:{" "}
+                                            {item.matchedEnrollmentSampleId ||
+                                              (item.wasSpeakerNameInputProvided ? "User input" : "None")}
+                                          </Text>
+                                          <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
+                                        </View>
+                                      ) : null}
+                                    </View>
+                                  ))
+                                : null}
                             </View>
-                            <Text style={styles.historyAttribution}>
-                              Source: {formatAttributionSource(item.speakerAttributionSource)}
-                              {typeof item.speakerConfidence === "number"
-                                ? ` • Confidence: ${(item.speakerConfidence * 100).toFixed(0)}%`
-                                : ""}
-                            </Text>
-                            {item.speakerNameInput ? (
-                              <Text style={styles.historyAttribution}>Typed name: {item.speakerNameInput}</Text>
-                            ) : null}
-                            {item.promptedSpeakerName ? (
-                              <Text style={styles.historyAttribution}>Prompted name: {item.promptedSpeakerName}</Text>
-                            ) : null}
-                            <Text style={styles.historyAttribution}>
-                              Matched sample: {item.matchedEnrollmentSampleId || (item.wasSpeakerNameInputProvided ? "User input" : "None")}
-                            </Text>
-                            <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
-                          </View>
-                        ) : null}
-                      </View>
-                    ))}
+                          );
+                        })
+                      : null}
                   </View>
                 ))
               )}
@@ -1202,7 +1325,7 @@ export default function App() {
         ) : null}
 
         {activeTab === "speakers" ? (
-          <View style={styles.tabContent}>
+          <ScrollView style={styles.speakerTabScroll} contentContainerStyle={styles.speakerTabContent}>
             <View style={styles.speakerActionsRow}>
               <Pressable style={styles.smallActionButton} onPress={() => fetchSpeakers()}>
                 <Text style={styles.smallActionButtonText}>Refresh Speakers</Text>
@@ -1212,59 +1335,82 @@ export default function App() {
             <View style={styles.speakerListPanel}>
               <Text style={styles.panelTitle}>Known Speakers</Text>
               <Text style={styles.speakerListHelp}>
-                Tap a speaker to add a short hint for AssemblyAI (accent, role, topics). Leave blank to clear.
+                Use Show Records to view or delete voice samples. Edit Hint adds context for AssemblyAI.
               </Text>
               {isLoadingSpeakers ? (
                 <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
               ) : speakers.length === 0 ? (
                 <Text style={styles.historyEmptyText}>No enrolled speakers yet.</Text>
               ) : (
-                speakers.map((speaker) => (
-                  <View key={speaker.name} style={styles.speakerListRow}>
-                    <View style={styles.speakerListHeaderRow}>
-                      <View style={styles.speakerListRowMain}>
-                        <Text style={styles.speakerListName}>
-                          {speaker.name} ({speaker.samples} samples)
-                        </Text>
-                        {speaker.description ? (
-                          <Text style={styles.speakerListHint} numberOfLines={2}>
-                            {speaker.description}
+                speakers.map((speaker) => {
+                  const sampleCount = speaker.enrollmentSamples?.length ?? 0;
+                  const isExpanded = expandedSpeakerNames.includes(speaker.name);
+
+                  return (
+                    <View key={speaker.name} style={styles.speakerListRow}>
+                      <View style={styles.speakerListHeaderRow}>
+                        <View style={styles.speakerListRowMain}>
+                          <Text style={styles.speakerListName}>
+                            {speaker.name} ({speaker.samples} samples)
                           </Text>
-                        ) : (
-                          <Text style={styles.speakerListHintPlaceholder}>No hint added</Text>
-                        )}
-                      </View>
-                      <Pressable onPress={() => openSpeakerHintModal(speaker)}>
-                        <Text style={styles.speakerListEdit}>Edit Hint</Text>
-                      </Pressable>
-                    </View>
-                    {speaker.enrollmentSamples?.length ? (
-                      <View style={styles.sampleList}>
-                        {speaker.enrollmentSamples.map((sample) => (
-                          <View key={sample.sampleId} style={styles.sampleRow}>
-                            <View style={styles.sampleRowMain}>
-                              <Text style={styles.sampleTitle}>{formatSampleTime(sample)}</Text>
-                              <Text style={styles.sampleMeta}>
-                                {formatSampleSource(sample.source)} • {sample.sampleId.slice(0, 8)}
-                              </Text>
-                            </View>
-                            <Pressable
-                              style={styles.sampleDeleteButton}
-                              onPress={() => deleteVoiceSample(speaker.name, sample.sampleId)}
+                          {speaker.description ? (
+                            <Text style={styles.speakerListHint} numberOfLines={2}>
+                              {speaker.description}
+                            </Text>
+                          ) : (
+                            <Text style={styles.speakerListHintPlaceholder}>No hint added</Text>
+                          )}
+                        </View>
+                        <View style={styles.speakerListActions}>
+                          <Pressable onPress={() => openSpeakerHintModal(speaker)}>
+                            <Text style={styles.speakerListEdit}>Edit Hint</Text>
+                          </Pressable>
+                          <Pressable
+                            disabled={sampleCount === 0}
+                            onPress={() => toggleSpeakerSamplesExpanded(speaker.name)}
+                          >
+                            <Text
+                              style={[
+                                styles.speakerListEdit,
+                                sampleCount === 0 && styles.speakerListActionDisabled,
+                              ]}
                             >
-                              <Text style={styles.sampleDeleteText}>Delete</Text>
-                            </Pressable>
-                          </View>
-                        ))}
+                              {sampleCount === 0
+                                ? "No Records"
+                                : isExpanded
+                                  ? "Hide Records"
+                                  : `Show ${sampleCount} Records`}
+                            </Text>
+                          </Pressable>
+                        </View>
                       </View>
-                    ) : (
-                      <Text style={styles.speakerListHintPlaceholder}>No deletable sample metadata yet.</Text>
-                    )}
-                  </View>
-                ))
+
+                      {sampleCount > 0 && isExpanded ? (
+                        <View style={styles.sampleList}>
+                          {speaker.enrollmentSamples?.map((sample) => (
+                            <View key={sample.sampleId} style={styles.sampleRow}>
+                              <View style={styles.sampleRowMain}>
+                                <Text style={styles.sampleTitle}>{formatSampleTime(sample)}</Text>
+                                <Text style={styles.sampleMeta}>
+                                  {formatSampleSource(sample.source)} • {sample.sampleId.slice(0, 8)}
+                                </Text>
+                              </View>
+                              <Pressable
+                                style={styles.sampleDeleteButton}
+                                onPress={() => deleteVoiceSample(speaker.name, sample.sampleId)}
+                              >
+                                <Text style={styles.sampleDeleteText}>Delete</Text>
+                              </Pressable>
+                            </View>
+                          ))}
+                        </View>
+                      ) : null}
+                    </View>
+                  );
+                })
               )}
             </View>
-          </View>
+          </ScrollView>
         ) : null}
       </View>
     </SafeAreaView>
@@ -1337,6 +1483,13 @@ const styles = StyleSheet.create({
   },
   tabContent: {
     marginTop: 2,
+  },
+  speakerTabScroll: {
+    marginTop: 2,
+    maxHeight: 560,
+  },
+  speakerTabContent: {
+    paddingBottom: 18,
   },
   tabIntro: {
     color: "#9aaad8",
@@ -1500,11 +1653,32 @@ const styles = StyleSheet.create({
   historyGroup: {
     marginBottom: 10,
   },
+  historyGroupTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
   historyGroupTitle: {
     color: "#b9c7f7",
     fontSize: 12,
     fontWeight: "700",
+    marginLeft: 2,
+  },
+  historyDateGroup: {
+    marginBottom: 8,
+    paddingLeft: 8,
+  },
+  historyDateGroupTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     marginBottom: 6,
+  },
+  historyDateGroupTitle: {
+    color: "#8ea1df",
+    fontSize: 11,
+    fontWeight: "700",
     marginLeft: 2,
   },
   historyMetaRow: {
@@ -1604,6 +1778,10 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
   },
+  speakerListActions: {
+    alignItems: "flex-end",
+    gap: 8,
+  },
   speakerListName: {
     color: "#e8edff",
     fontSize: 13,
@@ -1625,6 +1803,9 @@ const styles = StyleSheet.create({
     color: "#8ea1ff",
     fontSize: 12,
     fontWeight: "700",
+  },
+  speakerListActionDisabled: {
+    color: "#5f6b93",
   },
   sampleList: {
     marginTop: 10,
