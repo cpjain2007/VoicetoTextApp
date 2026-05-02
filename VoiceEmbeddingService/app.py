@@ -1,8 +1,10 @@
 import base64
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
@@ -15,9 +17,11 @@ from speechbrain.inference.speaker import EncoderClassifier
 
 
 MODEL_SOURCE = os.getenv("SPEAKER_EMBEDDING_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+MODEL_SAVEDIR = os.getenv("SPEAKER_EMBEDDING_MODEL_DIR", "/models/speechbrain-spkrec-ecapa-voxceleb")
 SERVICE_TOKEN = os.getenv("EMBEDDING_SERVICE_TOKEN", "").strip()
 
 app = FastAPI(title="Voice Embedding Service")
+logger = logging.getLogger("voice_embedding_service")
 
 
 class EmbedRequest(BaseModel):
@@ -42,9 +46,16 @@ def require_auth(authorization: Optional[str]) -> None:
 def get_classifier() -> EncoderClassifier:
     return EncoderClassifier.from_hparams(
         source=MODEL_SOURCE,
-        savedir="/tmp/speechbrain-spkrec-ecapa-voxceleb",
+        savedir=MODEL_SAVEDIR,
         run_opts={"device": "cpu"},
     )
+
+
+@app.on_event("startup")
+def warm_model() -> None:
+    start = time.perf_counter()
+    get_classifier()
+    logger.info("Embedding model loaded in %.3fs", time.perf_counter() - start)
 
 
 def decode_to_wav(audio_base64: str) -> Path:
@@ -110,10 +121,21 @@ def health():
 
 @app.post("/embed", response_model=EmbedResponse)
 def embed(payload: EmbedRequest, authorization: Optional[str] = Header(default=None)):
+    started = time.perf_counter()
     require_auth(authorization)
+    auth_done = time.perf_counter()
     wav_path = decode_to_wav(payload.audioBase64)
+    conversion_done = time.perf_counter()
     try:
         embedding = build_embedding(wav_path)
+        embedding_done = time.perf_counter()
+        logger.info(
+            "Embedding request timing auth=%.3fs convert=%.3fs embed=%.3fs total=%.3fs",
+            auth_done - started,
+            conversion_done - auth_done,
+            embedding_done - conversion_done,
+            embedding_done - started,
+        )
         return {"embedding": embedding, "model": MODEL_SOURCE}
     finally:
         shutil.rmtree(wav_path.parent, ignore_errors=True)

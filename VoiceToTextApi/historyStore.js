@@ -27,6 +27,64 @@ const cleanBoolean = (value) => value === true;
 
 const cleanNumber = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
 
+const cleanTimingSteps = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.slice(0, 25).map((item) => ({
+    step: cleanString(item?.step, 48),
+    ms: cleanNumber(item?.ms) ?? 0,
+  }));
+};
+
+const cleanRecognitionEngine = (value) => {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  return value === "embedding" || value === "fingerprint" || value === "none" ? value : null;
+};
+
+const cleanTranscriptionDiagnostics = (value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  return {
+    embeddingServiceConfigured: value.embeddingServiceConfigured === true,
+    embeddingFetchAttempted: value.embeddingFetchAttempted === true,
+    embeddingFetchSucceeded: value.embeddingFetchSucceeded === true,
+    embeddingDimensions: cleanNumber(value.embeddingDimensions),
+    embeddingError: cleanNullableString(value.embeddingError, 320),
+    embeddingTimeoutMs: cleanNumber(value.embeddingTimeoutMs),
+    speakerRecognitionEngine: cleanRecognitionEngine(value.speakerRecognitionEngine),
+    speakerMatchUsedEmbedding:
+      value.speakerMatchUsedEmbedding === true ? true : value.speakerMatchUsedEmbedding === false ? false : null,
+    speakerMatchUsedFingerprint:
+      value.speakerMatchUsedFingerprint === true
+        ? true
+        : value.speakerMatchUsedFingerprint === false
+          ? false
+          : null,
+    recognitionAttempted: value.recognitionAttempted === true,
+    profileEnrollmentAttempted: value.profileEnrollmentAttempted === true,
+    fingerprintVectorSavedToProfile: value.fingerprintVectorSavedToProfile === true,
+    embeddingVectorSavedToProfile: value.embeddingVectorSavedToProfile === true,
+    timingTotalMs: cleanNumber(value.timingTotalMs),
+    timingSteps: cleanTimingSteps(value.timingSteps),
+  };
+};
+
+const cleanHistoryDiagnosticsPayload = (value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const phase = value.phase === "enrollment" ? "enrollment" : "transcribe";
+  const base = cleanTranscriptionDiagnostics(value);
+  if (!base) {
+    return null;
+  }
+  return { phase, ...base };
+};
+
 const cleanAttributionSource = (value) => {
   const allowed = new Set([
     "speaker_name_input",
@@ -67,6 +125,15 @@ const sanitizeHistoryEntry = (entry) => {
     wasVoiceMatchUsed: cleanBoolean(entry?.wasVoiceMatchUsed),
     wasConflictPromptShown: cleanBoolean(entry?.wasConflictPromptShown),
     wasVoiceProfileEnrolled: cleanBoolean(entry?.wasVoiceProfileEnrolled),
+    firstPassRecognitionEngine: cleanRecognitionEngine(entry?.firstPassRecognitionEngine),
+    transcriptionDiagnosticsInitial: cleanHistoryDiagnosticsPayload({
+      ...entry?.transcriptionDiagnosticsInitial,
+      phase: "transcribe",
+    }),
+    transcriptionDiagnosticsEnrollment: cleanHistoryDiagnosticsPayload({
+      ...entry?.transcriptionDiagnosticsEnrollment,
+      phase: "enrollment",
+    }),
   };
 };
 

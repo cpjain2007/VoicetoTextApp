@@ -17,6 +17,28 @@ import {
   View,
 } from "react-native";
 
+type TranscriptionDiagnosticsPayload = {
+  embeddingServiceConfigured: boolean;
+  embeddingFetchAttempted: boolean;
+  embeddingFetchSucceeded: boolean;
+  embeddingDimensions: number | null;
+  embeddingError: string | null;
+  embeddingTimeoutMs: number | null;
+  speakerRecognitionEngine: "embedding" | "fingerprint" | "none" | null;
+  speakerMatchUsedEmbedding: boolean | null;
+  speakerMatchUsedFingerprint: boolean | null;
+  recognitionAttempted: boolean;
+  profileEnrollmentAttempted: boolean;
+  fingerprintVectorSavedToProfile: boolean;
+  embeddingVectorSavedToProfile: boolean;
+  timingTotalMs: number | null;
+  timingSteps: Array<{ step: string; ms: number }>;
+};
+
+type TranscriptionDiagnosticsPhase = TranscriptionDiagnosticsPayload & {
+  phase: "transcribe" | "enrollment";
+};
+
 type TranscriptLogItem = {
   id: string;
   speakerName: string;
@@ -38,6 +60,15 @@ type TranscriptLogItem = {
   wasVoiceMatchUsed?: boolean;
   wasConflictPromptShown?: boolean;
   wasVoiceProfileEnrolled?: boolean;
+  /**
+   * First transcribe API response `speakerRecognitionEngine`: which matcher picked the enrolled speaker (if any).
+   * Persisted for history clarity; also derivable from transcriptionDiagnosticsInitial when missing.
+   */
+  firstPassRecognitionEngine?: "embedding" | "fingerprint" | "none";
+  /** Server-side diagnostics for the first /transcribe-base64 call (no manual name). */
+  transcriptionDiagnosticsInitial?: TranscriptionDiagnosticsPhase | null;
+  /** Present when unknown-speaker flow re-uploaded audio with a name (enrollment). */
+  transcriptionDiagnosticsEnrollment?: TranscriptionDiagnosticsPhase | null;
 };
 
 type TranscriptionResult = {
@@ -49,6 +80,16 @@ type TranscriptionResult = {
   detectedSpeakerSampleSource: string | null;
   detectedSpeakerSampleCreatedAtIso: string | null;
   assemblySpeakerLabel: string | null;
+  speakerRecognitionEngine?: string | null;
+  speakerEmbeddingEnabled?: boolean;
+  speakerEmbeddingAvailable?: boolean;
+  transcriptionDiagnostics?: TranscriptionDiagnosticsPayload | null;
+};
+
+type NumericVectorPayload = {
+  values: number[];
+  dimensions?: number | null;
+  truncated?: boolean;
 };
 
 type SpeakerProfile = {
@@ -57,6 +98,13 @@ type SpeakerProfile = {
   /** Optional hint for AssemblyAI Speaker Identification (`speakerDescription` in API store). */
   description?: string;
   enrollmentSamples?: EnrollmentSample[];
+  /** Rollup 12-D fingerprint averaged across enrollments (API). */
+  profileVoiceFingerprint?: number[] | null;
+  profileVoiceFingerprintDimensions?: number | null;
+  profileVoiceFingerprintTruncated?: boolean;
+  profileVoiceFingerprintsRecent?: NumericVectorPayload[];
+  profileSpeakerEmbedding?: NumericVectorPayload | null;
+  profileSpeakerEmbeddingsRecent?: NumericVectorPayload[];
 };
 
 type EnrollmentSample = {
@@ -65,6 +113,14 @@ type EnrollmentSample = {
   createdAtMs?: number | null;
   createdAtIso?: string | null;
   historyClientId?: string | null;
+  hasFingerprint?: boolean;
+  hasEmbedding?: boolean;
+  voiceFingerprint?: number[] | null;
+  voiceFingerprintDimensions?: number | null;
+  voiceFingerprintTruncated?: boolean;
+  embeddingVector?: number[] | null;
+  embeddingDimensions?: number | null;
+  embeddingTruncated?: boolean;
 };
 
 type SpeakerCorrectionSuggestion = {
@@ -136,6 +192,41 @@ const formatSampleTime = (sample: EnrollmentSample) => {
   });
 };
 
+const formatVectorCsv = (values?: number[] | null) =>
+  Array.isArray(values) && values.length > 0 ? values.map((n) => String(n)).join(", ") : "";
+
+const VectorBlock = ({
+  title,
+  subtitle,
+  csv,
+  emptyLabel,
+  scrollMaxHeight = 132,
+}: {
+  title: string;
+  subtitle?: string;
+  csv: string;
+  emptyLabel: string;
+  scrollMaxHeight?: number;
+}) => (
+  <View style={styles.vectorBlock}>
+    <Text style={styles.vectorBlockTitle}>{title}</Text>
+    {subtitle ? <Text style={styles.vectorBlockSubtitle}>{subtitle}</Text> : null}
+    {csv ? (
+      <ScrollView
+        style={[styles.vectorScroll, { maxHeight: scrollMaxHeight }]}
+        nestedScrollEnabled
+        keyboardShouldPersistTaps="handled"
+      >
+        <Text style={styles.vectorMono} selectable>
+          {csv}
+        </Text>
+      </ScrollView>
+    ) : (
+      <Text style={styles.vectorBlockEmpty}>{emptyLabel}</Text>
+    )}
+  </View>
+);
+
 const formatHistoryDateGroup = (timestampMs: number) => {
   if (!Number.isFinite(timestampMs)) {
     return "Unknown date";
@@ -146,6 +237,366 @@ const formatHistoryDateGroup = (timestampMs: number) => {
     day: "2-digit",
     year: "numeric",
   });
+};
+
+const readRecognitionEngine = (
+  value: unknown,
+): TranscriptionDiagnosticsPayload["speakerRecognitionEngine"] => {
+  if (value === "embedding" || value === "fingerprint" || value === "none") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return null;
+};
+
+const parseTranscriptionDiagnostics = (raw: unknown): TranscriptionDiagnosticsPayload | null => {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const o = raw as Record<string, unknown>;
+  const stepsRaw = o.timingSteps;
+  const timingSteps = Array.isArray(stepsRaw)
+    ? stepsRaw.slice(0, 30).map((s) => {
+        if (!s || typeof s !== "object") {
+          return { step: "", ms: 0 };
+        }
+        const st = s as Record<string, unknown>;
+        return {
+          step: typeof st.step === "string" ? st.step : "",
+          ms: typeof st.ms === "number" && Number.isFinite(st.ms) ? st.ms : 0,
+        };
+      })
+    : [];
+  return {
+    embeddingServiceConfigured: o.embeddingServiceConfigured === true,
+    embeddingFetchAttempted: o.embeddingFetchAttempted === true,
+    embeddingFetchSucceeded: o.embeddingFetchSucceeded === true,
+    embeddingDimensions:
+      typeof o.embeddingDimensions === "number" && Number.isFinite(o.embeddingDimensions)
+        ? o.embeddingDimensions
+        : null,
+    embeddingError:
+      typeof o.embeddingError === "string" && o.embeddingError.trim()
+        ? o.embeddingError.trim().slice(0, 400)
+        : null,
+    embeddingTimeoutMs:
+      typeof o.embeddingTimeoutMs === "number" && Number.isFinite(o.embeddingTimeoutMs)
+        ? o.embeddingTimeoutMs
+        : null,
+    speakerRecognitionEngine: readRecognitionEngine(o.speakerRecognitionEngine),
+    speakerMatchUsedEmbedding:
+      o.speakerMatchUsedEmbedding === true ? true : o.speakerMatchUsedEmbedding === false ? false : null,
+    speakerMatchUsedFingerprint:
+      o.speakerMatchUsedFingerprint === true ? true : o.speakerMatchUsedFingerprint === false ? false : null,
+    recognitionAttempted: o.recognitionAttempted === true,
+    profileEnrollmentAttempted: o.profileEnrollmentAttempted === true,
+    fingerprintVectorSavedToProfile: o.fingerprintVectorSavedToProfile === true,
+    embeddingVectorSavedToProfile: o.embeddingVectorSavedToProfile === true,
+    timingTotalMs:
+      typeof o.timingTotalMs === "number" && Number.isFinite(o.timingTotalMs) ? o.timingTotalMs : null,
+    timingSteps,
+  };
+};
+
+const readDiagnosticsPhase = (raw: unknown): TranscriptionDiagnosticsPhase | undefined => {
+  const base = parseTranscriptionDiagnostics(raw);
+  if (!base) {
+    return undefined;
+  }
+  const phase =
+    raw && typeof raw === "object" && (raw as Record<string, unknown>).phase === "enrollment"
+      ? "enrollment"
+      : "transcribe";
+  return { ...base, phase };
+};
+
+const formatHistoryDiagnosticsText = (item: TranscriptLogItem) => {
+  const formatOne = (title: string, d: TranscriptionDiagnosticsPhase) => {
+    const emb = !d.embeddingFetchAttempted
+      ? "not attempted (service off)"
+      : d.embeddingFetchSucceeded
+        ? `ok (${d.embeddingDimensions ?? "?"} dims)`
+        : d.embeddingError
+          ? `failed: ${d.embeddingError}`
+          : "failed";
+    const engine =
+      d.profileEnrollmentAttempted && !d.recognitionAttempted
+        ? "skipped (enrollment only)"
+        : d.speakerRecognitionEngine ?? "—";
+    const steps =
+      d.timingSteps.length > 0 ? d.timingSteps.map((s) => `${s.step} ${s.ms}ms`).join(", ") : "—";
+    return [
+      title,
+      `  Embedding service configured: ${d.embeddingServiceConfigured ? "yes" : "no"}`,
+      `  Embedding client timeout: ${d.embeddingTimeoutMs ?? "—"} ms`,
+      `  Embedding fetch: ${emb}`,
+      `  Recognition attempted: ${d.recognitionAttempted ? "yes" : "no"}`,
+      `  Match engine: ${engine}`,
+      `  Used embedding for match: ${d.speakerMatchUsedEmbedding === true ? "yes" : d.speakerMatchUsedEmbedding === false ? "no" : "—"}`,
+      `  Used fingerprint for match: ${d.speakerMatchUsedFingerprint === true ? "yes" : d.speakerMatchUsedFingerprint === false ? "no" : "—"}`,
+      `  Saved 12-D fingerprint to profile: ${d.fingerprintVectorSavedToProfile ? "yes" : "no"}`,
+      `  Saved embedding vector to profile: ${d.embeddingVectorSavedToProfile ? "yes" : "no"}`,
+      `  Server total time: ${d.timingTotalMs ?? "—"} ms`,
+      `  Steps: ${steps}`,
+    ].join("\n");
+  };
+  const blocks: string[] = [];
+  if (item.transcriptionDiagnosticsInitial) {
+    blocks.push(formatOne("Pass 1 — listen / detect", item.transcriptionDiagnosticsInitial));
+  }
+  if (item.transcriptionDiagnosticsEnrollment) {
+    blocks.push(formatOne("Pass 2 — name + enroll", item.transcriptionDiagnosticsEnrollment));
+  }
+  return blocks.join("\n\n");
+};
+
+/** Maps `recordTiming(step)` keys from VoiceToTextApi `executeTranscription` to code-path descriptions. */
+const SERVER_TIMING_STEP_PATH: Record<string, string> = {
+  audio_fingerprint:
+    "app.js → convertAudioToPcm + voiceRecognition.buildVoiceSignature (12-D fingerprint from PCM)",
+  speaker_embedding:
+    "app.js → fetchSpeakerEmbedding (neural vector) when SPEAKER_EMBEDDING_SERVICE_URL is set; errors fall back to fingerprint matching",
+  speaker_matching:
+    "app.js → detectSpeakerNameByEmbedding if embedding present, else detectSpeakerName (fingerprint); skipped when a manual speaker name is supplied (enroll-only request)",
+  speaker_identification_prep:
+    "app.js → readSpeakerProfilesMerged + build AssemblyAI speaker hints (speech_understanding / known names)",
+  assembly_transcription:
+    "app.js → transcribeWithRetry (AssemblyAI with speaker_labels + language detection or forced language)",
+  response_preparation:
+    "app.js → dominant speaker label + utterances + transcriptionDiagnostics payload",
+};
+
+const explainServerRecognitionBranch = (d: TranscriptionDiagnosticsPhase): string[] => {
+  const lines: string[] = [];
+  if (d.profileEnrollmentAttempted && !d.recognitionAttempted) {
+    lines.push(
+      "Outcome: enrollment-only — manual speaker name was sent, so `executeTranscription` updated the profile and did not run speaker matching.",
+    );
+    if (d.fingerprintVectorSavedToProfile) {
+      lines.push("  └ Saved new 12-D fingerprint sample on the speaker profile.");
+    }
+    if (d.embeddingVectorSavedToProfile) {
+      lines.push("  └ Saved neural embedding on the profile (embedding fetch succeeded earlier).");
+    } else if (d.embeddingFetchAttempted && !d.embeddingFetchSucceeded) {
+      lines.push("  └ Embedding not stored (embedding fetch failed); fingerprint enrollment still applied.");
+    }
+    return lines;
+  }
+  if (!d.recognitionAttempted) {
+    lines.push("Outcome: recognition not attempted (unexpected state — check diagnostics).");
+    return lines;
+  }
+  if (d.speakerRecognitionEngine === "embedding") {
+    lines.push(
+      "Outcome: match via embedding — `detectSpeakerNameByEmbedding` scored enrolled profiles against this clip’s vector.",
+    );
+  } else if (d.speakerRecognitionEngine === "fingerprint") {
+    lines.push(
+      "Outcome: match via fingerprint — embedding unset or unused; `detectSpeakerName` compared 12-D signatures.",
+    );
+  } else if (d.speakerRecognitionEngine === "none" || d.speakerRecognitionEngine === null) {
+    lines.push(
+      "Outcome: no match — neither embedding nor fingerprint produced a confident enrolled speaker; UI may prompt for a name.",
+    );
+  } else {
+    lines.push(`Outcome: engine=${d.speakerRecognitionEngine ?? "—"}.`);
+  }
+  if (d.speakerMatchUsedEmbedding === true) {
+    lines.push("  └ Confirmed: embedding path contributed to the match decision.");
+  }
+  if (d.speakerMatchUsedFingerprint === true) {
+    lines.push("  └ Confirmed: fingerprint path contributed to the match decision.");
+  }
+  return lines;
+};
+
+const formatServerPassLogicalPath = (title: string, d: TranscriptionDiagnosticsPhase): string[] => {
+  const out: string[] = [`${title} (server: executeTranscription in app.js)`];
+  if (d.timingSteps.length > 0) {
+    d.timingSteps.forEach((s, i) => {
+      const path = SERVER_TIMING_STEP_PATH[s.step] || "(see API timing label)";
+      out.push(`  ${i + 1}. ${s.step} (+${s.ms} ms) — ${path}`);
+    });
+  } else {
+    out.push("  (No timing steps in payload — older server build or truncated response.)");
+  }
+  explainServerRecognitionBranch(d).forEach((line) => out.push(`  ${line}`));
+  return out;
+};
+
+/** Resolve which matcher decided pass-1 speaker (stored field wins, else diagnostics). */
+const resolvePass1RecognitionEngine = (
+  item: TranscriptLogItem,
+): "embedding" | "fingerprint" | "none" | undefined => {
+  const direct = item.firstPassRecognitionEngine;
+  if (direct === "embedding" || direct === "fingerprint" || direct === "none") {
+    return direct;
+  }
+  const e = item.transcriptionDiagnosticsInitial?.speakerRecognitionEngine;
+  if (e === "embedding" || e === "fingerprint" || e === "none") {
+    return e;
+  }
+  return undefined;
+};
+
+/** Precise embedding vs fingerprint breakdown for the History tab. */
+const formatHistoryVoiceMatchDetail = (item: TranscriptLogItem): string => {
+  const d1 = item.transcriptionDiagnosticsInitial;
+  const d2 = item.transcriptionDiagnosticsEnrollment;
+  const engine = resolvePass1RecognitionEngine(item);
+
+  const lines: string[] = [];
+
+  lines.push("Pass 1 — listen (request had no manual speaker name)");
+  if (engine === "embedding") {
+    lines.push(
+      "  • Enrolled speaker decided by: neural embedding match (clip vector vs stored ECAPA-style embeddings).",
+    );
+  } else if (engine === "fingerprint") {
+    lines.push(
+      "  • Enrolled speaker decided by: 12-D audio fingerprint match (PCM stats vs stored fingerprints).",
+    );
+  } else if (engine === "none") {
+    lines.push("  • Enrolled speaker decided by: no match — neither path exceeded the confidence threshold.");
+  } else {
+    lines.push("  • Enrolled speaker decided by: unknown (older entry or diagnostics missing).");
+  }
+
+  if (typeof item.speakerConfidence === "number" && Number.isFinite(item.speakerConfidence)) {
+    lines.push(
+      `  • Pass-1 match score (server): ${(item.speakerConfidence * 100).toFixed(1)}% (embedding vs fingerprint use different internal thresholds).`,
+    );
+  }
+
+  if (d1) {
+    const embOk = d1.embeddingFetchSucceeded === true;
+    const embTry = d1.embeddingFetchAttempted === true;
+    lines.push(
+      `  • Clip neural embedding computed: ${embOk ? `yes — ${d1.embeddingDimensions ?? "?"} dims` : embTry ? `no — ${d1.embeddingError?.trim() || "fetch failed"}` : "n/a (SPEAKER_EMBEDDING_SERVICE_URL not set)"}.`,
+    );
+    lines.push(
+      `  • Server match flags — used_embedding=${d1.speakerMatchUsedEmbedding === true ? "yes" : d1.speakerMatchUsedEmbedding === false ? "no" : "—"}, used_fingerprint=${d1.speakerMatchUsedFingerprint === true ? "yes" : d1.speakerMatchUsedFingerprint === false ? "no" : "—"}.`,
+    );
+    if (engine === "fingerprint" && embOk) {
+      lines.push(
+        "  • Interpretation: embedding ran but did not select the speaker; fingerprint matcher supplied the hit.",
+      );
+    }
+    if (engine === "fingerprint" && !embTry) {
+      lines.push("  • Interpretation: embedding service off — matching used fingerprints only.");
+    }
+    if (engine === "embedding" && d1.speakerMatchUsedFingerprint === true) {
+      lines.push(
+        "  • Note: fingerprint flag may also be true when both signals were evaluated; winning engine is embedding.",
+      );
+    }
+  } else {
+    lines.push("  • Pass-1 diagnostic payload not stored — only the summary line above may apply.");
+  }
+
+  if (d2) {
+    lines.push("Pass 2 — enroll (request included manual speaker name)");
+    lines.push(
+      `  • Speaker ID matching on this request: ${d2.recognitionAttempted ? "attempted" : "skipped"} (server enroll path when name is supplied).`,
+    );
+    lines.push(
+      `  • Saved to profile — 12-D fingerprint enrollment: ${d2.fingerprintVectorSavedToProfile ? "yes" : "no"}.`,
+    );
+    lines.push(
+      `  • Saved to profile — neural embedding enrollment: ${d2.embeddingVectorSavedToProfile ? "yes" : "no"}${d2.embeddingVectorSavedToProfile || !d2.embeddingFetchAttempted ? "" : " (clip had no usable embedding)"}.`,
+    );
+  }
+
+  return lines.join("\n");
+};
+
+const readFirstPassRecognitionEngineFromPayload = (item: Record<string, unknown>) => {
+  const v = item.firstPassRecognitionEngine;
+  if (v === "embedding" || v === "fingerprint" || v === "none") {
+    return v;
+  }
+  return undefined;
+};
+
+const firstPassEngineFromTranscriptionResult = (
+  r: TranscriptionResult,
+): TranscriptLogItem["firstPassRecognitionEngine"] | undefined => {
+  const v = r.speakerRecognitionEngine;
+  if (v === "embedding" || v === "fingerprint" || v === "none") {
+    return v;
+  }
+  if (v === null) {
+    return "none";
+  }
+  return undefined;
+};
+
+/** Narrative: app decisions (App.tsx) + server pipeline steps for each pass. */
+const formatHistoryLogicalFlow = (item: TranscriptLogItem): string => {
+  const lines: string[] = [];
+  lines.push("App (App.tsx)");
+  lines.push("  1. Stop recording → transcribeAudio(uri, \"\") — first POST /transcribe-base64 without manual speaker name.");
+  if (item.wasConflictPromptShown) {
+    lines.push(
+      "  2. Conflict — resolveSpeakerNameConflict: choose between a typed name and the server’s enrolled-speaker guess.",
+    );
+  }
+  if (item.wasUnknownSpeakerPromptShown) {
+    lines.push(
+      "  Unknown-speaker flow — openUnknownSpeakerNamePrompt: first pass still produced the “Unknown speaker” label.",
+    );
+    if (item.promptedSpeakerName) {
+      lines.push(
+        `  └ User named “${item.promptedSpeakerName}” → second transcribeAudio(..., name) for enrollment (same clip).`,
+      );
+    } else {
+      lines.push("  └ User skipped — no second POST; transcript kept as unknown without enrolling.");
+    }
+  } else if (item.wasVoiceMatchUsed) {
+    const eng = resolvePass1RecognitionEngine(item);
+    const detail =
+      eng === "embedding"
+        ? " — winner: neural embedding (speaker vector)"
+        : eng === "fingerprint"
+          ? " — winner: 12-D audio fingerprint"
+          : eng === "none"
+            ? ""
+            : "";
+    lines.push(
+      `  After pass 1 — enrolled speaker from voice matching${detail}; unknown-speaker modal was not needed.`,
+    );
+  } else {
+    lines.push(
+      "  After pass 1 — unknown-speaker modal not shown; final name comes from Source / attribution below (not a voice match to an enrollment).",
+    );
+  }
+  lines.push(
+    `  Final label: ${formatAttributionSource(item.speakerAttributionSource)} → “${item.speakerName}”.`,
+  );
+  if (item.assemblySpeakerLabel) {
+    lines.push(
+      `  AssemblyAI diarization speaker id (dominant): ${item.assemblySpeakerLabel} — utterance labels, separate from enrolled name.`,
+    );
+  }
+
+  if (item.transcriptionDiagnosticsInitial) {
+    lines.push("");
+    lines.push(...formatServerPassLogicalPath("Pass 1 — listen / match / transcribe", item.transcriptionDiagnosticsInitial));
+  }
+  if (item.transcriptionDiagnosticsEnrollment) {
+    lines.push("");
+    lines.push(...formatServerPassLogicalPath("Pass 2 — enroll named speaker", item.transcriptionDiagnosticsEnrollment));
+  }
+  if (!item.transcriptionDiagnosticsInitial && !item.transcriptionDiagnosticsEnrollment) {
+    lines.push("");
+    lines.push(
+      "(No transcriptionDiagnostics on this entry — only the app steps above; reconnect or re-record to capture server timing.)",
+    );
+  }
+
+  return lines.join("\n");
 };
 
 const readString = (item: Record<string, unknown>, key: string) =>
@@ -185,6 +636,14 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
   const id = clientId || rawId || `${createdAtMs}`;
   const cloudHistoryId = clientId && rawId && rawId !== clientId ? rawId : readString(item, "cloudHistoryId").trim();
 
+  const transcriptionDiagnosticsInitial = readDiagnosticsPhase(item.transcriptionDiagnosticsInitial);
+  const transcriptionDiagnosticsEnrollment = readDiagnosticsPhase(item.transcriptionDiagnosticsEnrollment);
+  const fromPayload = readFirstPassRecognitionEngineFromPayload(item);
+  const fromDiag = transcriptionDiagnosticsInitial?.speakerRecognitionEngine;
+  const firstPassRecognitionEngine =
+    fromPayload ??
+    (fromDiag === "embedding" || fromDiag === "fingerprint" || fromDiag === "none" ? fromDiag : undefined);
+
   return {
     id,
     speakerName: readString(item, "speakerName").trim() || UNKNOWN_SPEAKER_LABEL,
@@ -206,6 +665,9 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
     wasVoiceMatchUsed: readBoolean(item, "wasVoiceMatchUsed"),
     wasConflictPromptShown: readBoolean(item, "wasConflictPromptShown"),
     wasVoiceProfileEnrolled: readBoolean(item, "wasVoiceProfileEnrolled"),
+    ...(firstPassRecognitionEngine ? { firstPassRecognitionEngine } : {}),
+    transcriptionDiagnosticsInitial,
+    transcriptionDiagnosticsEnrollment,
   };
 };
 
@@ -406,6 +868,10 @@ export default function App() {
       assemblySpeakerLabel?: string | null;
       speakerIdentificationCandidates?: string[];
       speakerIdentificationMapping?: Record<string, unknown> | null;
+      speakerRecognitionEngine?: string | null;
+      speakerEmbeddingEnabled?: boolean;
+      speakerEmbeddingAvailable?: boolean;
+      transcriptionDiagnostics?: unknown;
     };
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",
@@ -429,6 +895,15 @@ export default function App() {
         typeof data.assemblySpeakerLabel === "string" && data.assemblySpeakerLabel.trim()
           ? data.assemblySpeakerLabel.trim()
           : null,
+      speakerRecognitionEngine:
+        typeof data.speakerRecognitionEngine === "string"
+          ? data.speakerRecognitionEngine
+          : data.speakerRecognitionEngine === null
+            ? null
+            : undefined,
+      speakerEmbeddingEnabled: data.speakerEmbeddingEnabled === true,
+      speakerEmbeddingAvailable: data.speakerEmbeddingAvailable === true,
+      transcriptionDiagnostics: parseTranscriptionDiagnostics(data.transcriptionDiagnostics),
     } satisfies TranscriptionResult;
   };
 
@@ -795,6 +1270,14 @@ export default function App() {
         const result = await transcribeAudio(uri, "", {
           historyClientId,
         });
+        let transcriptionDiagnosticsInitial: TranscriptionDiagnosticsPhase | undefined;
+        if (result.transcriptionDiagnostics) {
+          transcriptionDiagnosticsInitial = readDiagnosticsPhase({
+            ...result.transcriptionDiagnostics,
+            phase: "transcribe",
+          });
+        }
+        let transcriptionDiagnosticsEnrollment: TranscriptionDiagnosticsPhase | undefined;
         const text = result.text;
         const manualSpeakerName = "";
         const typedSpeakerName = "";
@@ -856,6 +1339,12 @@ export default function App() {
                 enrollmentSource: "unknown_speaker_prompt",
                 historyClientId,
               });
+              if (enrollmentResult.transcriptionDiagnostics) {
+                transcriptionDiagnosticsEnrollment = readDiagnosticsPhase({
+                  ...enrollmentResult.transcriptionDiagnostics,
+                  phase: "enrollment",
+                });
+              }
               shouldRefreshSpeakers = true;
               enrolledVoiceAsName = enrollmentResult.enrolledSpeakerName || trimmedEntered;
               normalizedSpeakerName = enrolledVoiceAsName;
@@ -875,6 +1364,7 @@ export default function App() {
 
         setTranscript(text);
         setLastSpeakerName(normalizedSpeakerName);
+        const pass1RecognitionEngine = firstPassEngineFromTranscriptionResult(result);
         const newHistoryEntry: TranscriptLogItem = {
           id: historyClientId,
           speakerName: normalizedSpeakerName,
@@ -895,6 +1385,9 @@ export default function App() {
           wasVoiceMatchUsed,
           wasConflictPromptShown,
           wasVoiceProfileEnrolled: !!enrolledVoiceAsName || (!!typedSpeakerName && !voiceEnrollmentRequestFailed),
+          ...(pass1RecognitionEngine ? { firstPassRecognitionEngine: pass1RecognitionEngine } : {}),
+          ...(transcriptionDiagnosticsInitial ? { transcriptionDiagnosticsInitial } : {}),
+          ...(transcriptionDiagnosticsEnrollment ? { transcriptionDiagnosticsEnrollment } : {}),
         };
         const nextHistory = [newHistoryEntry, ...history];
         setHistory((current) => [
@@ -1270,6 +1763,23 @@ export default function App() {
                                             {item.matchedEnrollmentSampleId ||
                                               (item.wasSpeakerNameInputProvided ? "User input" : "None")}
                                           </Text>
+                                          <Text style={styles.historySectionLabel}>Voice match</Text>
+                                          <Text style={styles.historyVoiceMatchDetail} selectable>
+                                            {formatHistoryVoiceMatchDetail(item)}
+                                          </Text>
+                                          <Text style={styles.historySectionLabel}>Logical path</Text>
+                                          <Text style={styles.historyLogicalFlow} selectable>
+                                            {formatHistoryLogicalFlow(item)}
+                                          </Text>
+                                          {item.transcriptionDiagnosticsInitial ||
+                                          item.transcriptionDiagnosticsEnrollment ? (
+                                            <>
+                                              <Text style={styles.historySectionLabel}>Server diagnostics</Text>
+                                              <Text style={styles.historyDiagnostics}>
+                                                {formatHistoryDiagnosticsText(item)}
+                                              </Text>
+                                            </>
+                                          ) : null}
                                           <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
                                         </View>
                                       ) : null}
@@ -1298,7 +1808,8 @@ export default function App() {
             <View style={styles.speakerListPanel}>
               <Text style={styles.panelTitle}>Known Speakers</Text>
               <Text style={styles.speakerListHelp}>
-                Use Show Records to view or delete voice samples. Edit Hint adds context for AssemblyAI.
+                Show Records lists each enrollment. Fingerprint = 12-D audio stats; embedding = ECAPA speaker
+                vector when saved.
               </Text>
               {isLoadingSpeakers ? (
                 <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
@@ -1350,13 +1861,105 @@ export default function App() {
 
                       {sampleCount > 0 && isExpanded ? (
                         <View style={styles.sampleList}>
+                          <View style={styles.profileVectorsSection}>
+                            <Text style={styles.profileVectorsHeading}>Profile-level vectors</Text>
+                            <Text style={styles.profileVectorsHint}>
+                              Averaged values are rolled up from your saved samples on the server. Use for debugging,
+                              not for sharing (they identify a voice).
+                            </Text>
+                            <VectorBlock
+                              title={`Averaged fingerprint (${speaker.profileVoiceFingerprintDimensions ?? 12}-D roll-up)`}
+                              subtitle={
+                                speaker.profileVoiceFingerprintTruncated ? "Truncated in API response" : undefined
+                              }
+                              csv={formatVectorCsv(speaker.profileVoiceFingerprint)}
+                              emptyLabel="No aggregate fingerprint on profile."
+                              scrollMaxHeight={120}
+                            />
+                            {speaker.profileVoiceFingerprintsRecent?.length ? (
+                              <Text style={styles.recentVectorsLabel}>Recent roll-up fingerprints (last sessions)</Text>
+                            ) : null}
+                            {speaker.profileVoiceFingerprintsRecent?.map((row, idx) => (
+                              <VectorBlock
+                                key={`pfp-${speaker.name}-${idx}`}
+                                title={`Rolling fingerprint #${idx + 1} (${row.dimensions ?? row.values.length}-D)`}
+                                subtitle={row.truncated ? "Truncated in API response" : undefined}
+                                csv={formatVectorCsv(row.values)}
+                                emptyLabel=""
+                                scrollMaxHeight={96}
+                              />
+                            ))}
+                            {speaker.profileSpeakerEmbedding ? (
+                              <VectorBlock
+                                title={`Averaged speaker embedding (${speaker.profileSpeakerEmbedding.dimensions ?? speaker.profileSpeakerEmbedding.values.length}-D, neural)`}
+                                subtitle={
+                                  speaker.profileSpeakerEmbedding.truncated
+                                    ? `Showing first ${speaker.profileSpeakerEmbedding.values.length} values; full vector is longer.`
+                                    : undefined
+                                }
+                                csv={formatVectorCsv(speaker.profileSpeakerEmbedding.values)}
+                                emptyLabel="No aggregate embedding."
+                                scrollMaxHeight={168}
+                              />
+                            ) : (
+                              <Text style={styles.vectorBlockEmpty}>No aggregate speaker embedding on profile yet.</Text>
+                            )}
+                            {speaker.profileSpeakerEmbeddingsRecent?.length ? (
+                              <Text style={styles.recentVectorsLabel}>Recent embedding snapshots</Text>
+                            ) : null}
+                            {speaker.profileSpeakerEmbeddingsRecent?.map((row, idx) => (
+                              <VectorBlock
+                                key={`pem-${speaker.name}-${idx}`}
+                                title={`Embedding snapshot #${idx + 1} (${row.dimensions ?? row.values.length}-D)`}
+                                subtitle={
+                                  row.truncated
+                                    ? `Showing first ${row.values.length} values; full vector is longer.`
+                                    : undefined
+                                }
+                                csv={formatVectorCsv(row.values)}
+                                emptyLabel=""
+                                scrollMaxHeight={140}
+                              />
+                            ))}
+                          </View>
+
                           {speaker.enrollmentSamples?.map((sample) => (
                             <View key={sample.sampleId} style={styles.sampleRow}>
                               <View style={styles.sampleRowMain}>
                                 <Text style={styles.sampleTitle}>{formatSampleTime(sample)}</Text>
                                 <Text style={styles.sampleMeta}>
-                                  {formatSampleSource(sample.source)} • {sample.sampleId.slice(0, 8)}
+                                  {formatSampleSource(sample.source)} • sample {sample.sampleId.slice(0, 8)}…
                                 </Text>
+                                <VectorBlock
+                                  title={`Fingerprint (${sample.voiceFingerprintDimensions ?? 12}-D audio stats)`}
+                                  subtitle={
+                                    sample.voiceFingerprintTruncated ? "Truncated in API response" : undefined
+                                  }
+                                  csv={formatVectorCsv(sample.voiceFingerprint)}
+                                  emptyLabel={
+                                    sample.hasFingerprint === false
+                                      ? "No fingerprint stored for this sample."
+                                      : "No fingerprint returned (older server data?)."
+                                  }
+                                  scrollMaxHeight={88}
+                                />
+                                <VectorBlock
+                                  title={`Speaker embedding (${sample.embeddingDimensions ?? "?"}-D, neural)`}
+                                  subtitle={
+                                    sample.embeddingTruncated
+                                      ? `Showing first ${sample.embeddingVector?.length ?? 0} values; full vector is longer.`
+                                      : !sample.embeddingVector?.length && sample.hasEmbedding
+                                        ? "Embedding exists but was not returned (refresh after app update)."
+                                        : undefined
+                                  }
+                                  csv={formatVectorCsv(sample.embeddingVector)}
+                                  emptyLabel={
+                                    sample.hasEmbedding === false
+                                      ? "No embedding stored for this sample (record with embedding service healthy + named save)."
+                                      : "No embedding returned."
+                                  }
+                                  scrollMaxHeight={112}
+                                />
                               </View>
                               <Pressable
                                 style={styles.sampleDeleteButton}
@@ -1662,6 +2265,53 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     marginBottom: 4,
   },
+  historySectionLabel: {
+    color: "#aebfff",
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  historyVoiceMatchDetail: {
+    color: "#e2eaff",
+    fontSize: 11,
+    lineHeight: 17,
+    marginBottom: 4,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#0f1628",
+    borderRadius: 8,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#2a5080",
+  },
+  historyLogicalFlow: {
+    color: "#c5d5ff",
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 8,
+    marginBottom: 6,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#12182e",
+    borderRadius: 8,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#2c3a6e",
+  },
+  historyDiagnostics: {
+    color: "#b8ccff",
+    fontSize: 10,
+    lineHeight: 14,
+    marginTop: 6,
+    marginBottom: 8,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#0a0f22",
+    borderRadius: 8,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: "#202c55",
+  },
   deleteLogButton: {
     borderRadius: 8,
     borderWidth: 1,
@@ -1752,9 +2402,61 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     gap: 8,
   },
+  profileVectorsSection: {
+    marginBottom: 4,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#253264",
+  },
+  profileVectorsHeading: {
+    color: "#e8ecff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  profileVectorsHint: {
+    color: "#7580ab",
+    fontSize: 10,
+    marginTop: 4,
+    marginBottom: 6,
+    lineHeight: 14,
+  },
+  recentVectorsLabel: {
+    color: "#8ea1df",
+    fontSize: 11,
+    fontWeight: "600",
+    marginTop: 10,
+  },
+  vectorBlock: {
+    marginTop: 8,
+  },
+  vectorBlockTitle: {
+    color: "#8ea1ff",
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  vectorBlockSubtitle: {
+    color: "#c9a227",
+    fontSize: 10,
+    marginTop: 2,
+  },
+  vectorBlockEmpty: {
+    color: "#5c6a8e",
+    fontSize: 10,
+    fontStyle: "italic",
+    marginTop: 4,
+  },
+  vectorScroll: {
+    marginTop: 4,
+  },
+  vectorMono: {
+    color: "#dce4ff",
+    fontSize: 9,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    lineHeight: 13,
+  },
   sampleRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 10,
   },

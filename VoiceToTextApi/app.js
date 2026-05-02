@@ -38,6 +38,10 @@ const speakerEmbeddingServiceToken = (process.env.SPEAKER_EMBEDDING_SERVICE_TOKE
 const speakerEmbeddingMatchThreshold = Number(process.env.SPEAKER_EMBEDDING_MATCH_THRESHOLD || "0.55");
 const speakerEmbeddingMatchMargin = Number(process.env.SPEAKER_EMBEDDING_MATCH_MARGIN || "0.05");
 const speakerEmbeddingHighConfidenceOverride = Number(process.env.SPEAKER_EMBEDDING_HIGH_CONFIDENCE_OVERRIDE || "0.75");
+const speakerEmbeddingTimeoutMs = Math.min(
+  Math.max(Number(process.env.SPEAKER_EMBEDDING_TIMEOUT_MS || "18000") || 18000, 1000),
+  45000,
+);
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
@@ -185,7 +189,7 @@ const fetchSpeakerEmbedding = async (audioBuffer, mimeType) => {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
+  const timeout = setTimeout(() => controller.abort(), speakerEmbeddingTimeoutMs);
   try {
     const response = await withRetries(
       () =>
@@ -201,7 +205,7 @@ const fetchSpeakerEmbedding = async (audioBuffer, mimeType) => {
             mimeType: mimeType || "audio/m4a",
           }),
         }),
-      { label: "SpeakerEmbedding.embed", maxAttempts: 2, baseDelayMs: 600 },
+      { label: "SpeakerEmbedding.embed", maxAttempts: 1, baseDelayMs: 600 },
     );
     const text = await response.text();
     if (!response.ok) {
@@ -502,19 +506,87 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}, speak
   return savedSpeakerName;
 };
 
+/** Max embedding floats returned per vector in GET /speakers (full ECAPA ~192). */
+const publicSpeakerEmbeddingMaxLength = Math.min(
+  Math.max(Number(process.env.PUBLIC_SPEAKER_EMBEDDING_MAX_LENGTH || "1024") || 1024, 32),
+  2048,
+);
+
+const roundNumericArray = (value, decimals, maxLength) => {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { numbers: null, sourceLength: 0, truncated: false };
+  }
+  const sourceLength = value.length;
+  const capped = typeof maxLength === "number" && maxLength > 0 ? value.slice(0, maxLength) : value;
+  const numbers = capped.map((item) => {
+    const n = Number(item);
+    if (!Number.isFinite(n)) {
+      return 0;
+    }
+    return Number(n.toFixed(decimals));
+  });
+  return { numbers, sourceLength, truncated: sourceLength > numbers.length };
+};
+
 const publicEnrollmentSamples = (profile) =>
   Array.isArray(profile?.enrollmentSamples)
     ? profile.enrollmentSamples
         .filter((sample) => sample && typeof sample === "object" && typeof sample.sampleId === "string")
-        .map((sample) => ({
-          sampleId: sample.sampleId,
-          source: typeof sample.source === "string" ? sample.source : "unknown",
-          createdAtMs: typeof sample.createdAtMs === "number" ? sample.createdAtMs : null,
-          createdAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
-          historyClientId: typeof sample.historyClientId === "string" ? sample.historyClientId : null,
-          hasEmbedding: Array.isArray(sample.embeddingVector) && sample.embeddingVector.length > 0,
-        }))
+        .map((sample) => {
+          const fp = roundNumericArray(sample.vector, 6, 32);
+          const emb = roundNumericArray(sample.embeddingVector, 6, publicSpeakerEmbeddingMaxLength);
+          return {
+            sampleId: sample.sampleId,
+            source: typeof sample.source === "string" ? sample.source : "unknown",
+            createdAtMs: typeof sample.createdAtMs === "number" ? sample.createdAtMs : null,
+            createdAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
+            historyClientId: typeof sample.historyClientId === "string" ? sample.historyClientId : null,
+            hasFingerprint: Array.isArray(sample.vector) && sample.vector.length > 0,
+            hasEmbedding: Array.isArray(sample.embeddingVector) && sample.embeddingVector.length > 0,
+            voiceFingerprintDimensions: fp.sourceLength || null,
+            voiceFingerprint: fp.numbers,
+            voiceFingerprintTruncated: fp.truncated,
+            embeddingDimensions: emb.sourceLength || null,
+            embeddingVector: emb.numbers,
+            embeddingTruncated: emb.truncated,
+          };
+        })
     : [];
+
+const publicProfileVoiceRollups = (profile) => {
+  const aggFp = roundNumericArray(profile?.vector, 6, 32);
+  const recentFp = Array.isArray(profile?.vectorsRecent)
+    ? profile.vectorsRecent.map((v) => roundNumericArray(v, 6, 32)).filter((item) => item.numbers && item.numbers.length)
+    : [];
+  const aggEmb = roundNumericArray(profile?.embeddingVector, 6, publicSpeakerEmbeddingMaxLength);
+  const recentEmb = Array.isArray(profile?.embeddingRecent)
+    ? profile.embeddingRecent
+        .map((v) => roundNumericArray(v, 6, publicSpeakerEmbeddingMaxLength))
+        .filter((item) => item.numbers && item.numbers.length)
+    : [];
+  return {
+    profileVoiceFingerprint: aggFp.numbers,
+    profileVoiceFingerprintDimensions: aggFp.sourceLength || null,
+    profileVoiceFingerprintTruncated: aggFp.truncated,
+    profileVoiceFingerprintsRecent: recentFp.map((item) => ({
+      values: item.numbers,
+      dimensions: item.sourceLength,
+      truncated: item.truncated,
+    })),
+    profileSpeakerEmbedding: aggEmb.numbers
+      ? {
+          values: aggEmb.numbers,
+          dimensions: aggEmb.sourceLength,
+          truncated: aggEmb.truncated,
+        }
+      : null,
+    profileSpeakerEmbeddingsRecent: recentEmb.map((item) => ({
+      values: item.numbers,
+      dimensions: item.sourceLength,
+      truncated: item.truncated,
+    })),
+  };
+};
 
 const rebuildProfileFromEnrollmentSamples = (profile, enrollmentSamples) => {
   const validSamples = enrollmentSamples.filter((sample) => Array.isArray(sample?.vector) && sample.vector.length > 0);
@@ -770,8 +842,22 @@ const detectSpeakerNameByEmbedding = async (speakerEmbedding) => {
   const best = scored[0];
   const second = scored[1];
   console.log("Speaker embedding candidates", {
-    best: best ? { name: best.name, score: Number(best.score.toFixed(4)), sampleSource: best.sampleSource } : null,
-    second: second ? { name: second.name, score: Number(second.score.toFixed(4)) } : null,
+    best: best
+      ? {
+          name: best.name,
+          score: Number(best.score.toFixed(4)),
+          sampleId: best.sampleId,
+          sampleSource: best.sampleSource,
+        }
+      : null,
+    second: second
+      ? {
+          name: second.name,
+          score: Number(second.score.toFixed(4)),
+          sampleId: second.sampleId,
+          sampleSource: second.sampleSource,
+        }
+      : null,
     threshold: speakerEmbeddingMatchThreshold,
     margin: speakerEmbeddingMatchMargin,
     highConfidenceOverride: speakerEmbeddingHighConfidenceOverride,
@@ -809,8 +895,22 @@ const detectSpeakerName = async (signature) => {
   const best = scored[0];
   const second = scored[1];
   console.log("Speaker match candidates", {
-    best: best ? { name: best.name, score: Number(best.score.toFixed(4)), sampleSource: best.sampleSource } : null,
-    second: second ? { name: second.name, score: Number(second.score.toFixed(4)) } : null,
+    best: best
+      ? {
+          name: best.name,
+          score: Number(best.score.toFixed(4)),
+          sampleId: best.sampleId,
+          sampleSource: best.sampleSource,
+        }
+      : null,
+    second: second
+      ? {
+          name: second.name,
+          score: Number(second.score.toFixed(4)),
+          sampleId: second.sampleId,
+          sampleSource: second.sampleSource,
+        }
+      : null,
     threshold: speakerSimilarityThreshold,
     relaxedEnabled: speakerMatchRelaxedEnabled,
     relaxedThreshold: getSpeakerMatchRelaxedThreshold(),
@@ -851,6 +951,7 @@ app.get("/speakers", async (_req, res) => {
         return {
           name: profile.name,
           samples: profile.samples || 0,
+          ...publicProfileVoiceRollups(profile),
           enrollmentSamples: publicEnrollmentSamples(profile),
           ...(desc.trim() ? { description: desc.trim() } : {}),
         };
@@ -1005,6 +1106,14 @@ app.post("/history", async (req, res) => {
 });
 
 const executeTranscription = async (req, res, fileLike) => {
+  const startedAtMs = Date.now();
+  let lastTimingMs = startedAtMs;
+  const timings = [];
+  const recordTiming = (step) => {
+    const now = Date.now();
+    timings.push({ step, ms: now - lastTimingMs });
+    lastTimingMs = now;
+  };
   try {
     if (!assemblyApiKey) {
       return res.status(500).json({ error: "ASSEMBLYAI_API_KEY is not configured." });
@@ -1028,16 +1137,20 @@ const executeTranscription = async (req, res, fileLike) => {
     const extension = extensionFromMime(fileLike.mimetype);
     const pcmBuffer = await convertAudioToPcm(fileLike.buffer, extension);
     const voiceSignature = voiceRecognition.buildVoiceSignature(pcmBuffer);
+    recordTiming("audio_fingerprint");
     let speakerEmbedding = null;
+    let embeddingFetchError = null;
     if (speakerEmbeddingServiceUrl) {
       try {
         speakerEmbedding = await fetchSpeakerEmbedding(fileLike.buffer, fileLike.mimetype);
-      } catch (embeddingError) {
+      } catch (err) {
+        embeddingFetchError = err instanceof Error ? err.message : String(err);
         console.warn("Speaker embedding unavailable; falling back to fingerprint matching", {
-          message: embeddingError instanceof Error ? embeddingError.message : String(embeddingError),
+          message: embeddingFetchError,
         });
       }
     }
+    recordTiming("speaker_embedding");
     const speakerNameHeader =
       typeof req.headers["x-speaker-name"] === "string" ? req.headers["x-speaker-name"].trim() : "";
     const speakerNameQuery =
@@ -1061,6 +1174,7 @@ const executeTranscription = async (req, res, fileLike) => {
       ? null
       : (speakerEmbedding ? await detectSpeakerNameByEmbedding(speakerEmbedding) : null) ||
         (await detectSpeakerName(voiceSignature));
+    recordTiming("speaker_matching");
 
     const profilesForIdentification = await readSpeakerProfilesMerged();
     const knownSpeakerValues = voiceRecognition.prioritizeSpeakerNameInKnownList(
@@ -1088,6 +1202,7 @@ const executeTranscription = async (req, res, fileLike) => {
         knownSpeakerValues,
         speakerIdentificationEnabled,
       );
+    recordTiming("speaker_identification_prep");
 
     const baseTranscriptOptions = {
       audio: fileLike.buffer,
@@ -1175,6 +1290,7 @@ const executeTranscription = async (req, res, fileLike) => {
     if (transcript.status === "error") {
       throw new Error(transcript.error || "AssemblyAI transcription failed.");
     }
+    recordTiming("assembly_transcription");
 
     const transcriptText = transcript.text || "";
     const utterances = Array.isArray(transcript.utterances) ? transcript.utterances : [];
@@ -1183,6 +1299,45 @@ const executeTranscription = async (req, res, fileLike) => {
 
     const speakerIdentificationCandidates =
       assemblySpeakers.length > 0 ? assemblySpeakers.map((s) => s.name) : knownSpeakerValues;
+    recordTiming("response_preparation");
+    console.log("Transcription timing", {
+      totalMs: Date.now() - startedAtMs,
+      steps: timings,
+      embeddingTimeoutMs: speakerEmbeddingTimeoutMs,
+      speakerEmbeddingEnabled: !!speakerEmbeddingServiceUrl,
+      speakerEmbeddingAvailable: !!speakerEmbedding,
+      recognitionEngine: detectedSpeaker?.recognitionEngine || "fingerprint",
+    });
+
+    const recognitionAttempted = !manualSpeakerName;
+    const speakerRecognitionEngineForDiagnostics = manualSpeakerName
+      ? null
+      : detectedSpeaker
+        ? detectedSpeaker.recognitionEngine
+        : "none";
+    const speakerMatchUsedEmbedding =
+      recognitionAttempted && detectedSpeaker?.recognitionEngine === "embedding";
+    const speakerMatchUsedFingerprint =
+      recognitionAttempted && detectedSpeaker?.recognitionEngine === "fingerprint";
+    const transcriptionDiagnostics = {
+      embeddingServiceConfigured: !!speakerEmbeddingServiceUrl,
+      embeddingFetchAttempted: !!speakerEmbeddingServiceUrl,
+      embeddingFetchSucceeded: !!speakerEmbedding,
+      embeddingDimensions: Array.isArray(speakerEmbedding) ? speakerEmbedding.length : null,
+      embeddingError: embeddingFetchError
+        ? String(embeddingFetchError).replace(/\s+/g, " ").trim().slice(0, 320)
+        : null,
+      embeddingTimeoutMs: speakerEmbeddingTimeoutMs,
+      speakerRecognitionEngine: speakerRecognitionEngineForDiagnostics,
+      speakerMatchUsedEmbedding,
+      speakerMatchUsedFingerprint,
+      recognitionAttempted,
+      profileEnrollmentAttempted: !!manualSpeakerName,
+      fingerprintVectorSavedToProfile: !!manualSpeakerName,
+      embeddingVectorSavedToProfile: !!(manualSpeakerName && speakerEmbedding),
+      timingTotalMs: Date.now() - startedAtMs,
+      timingSteps: timings.map((item) => ({ step: item.step, ms: item.ms })),
+    };
 
     return res.json({
       text: transcriptText,
@@ -1192,12 +1347,13 @@ const executeTranscription = async (req, res, fileLike) => {
       detectedSpeakerSampleId: detectedSpeaker?.sampleId || null,
       detectedSpeakerSampleSource: detectedSpeaker?.sampleSource || null,
       detectedSpeakerSampleCreatedAtIso: detectedSpeaker?.sampleCreatedAtIso || null,
-      speakerRecognitionEngine: detectedSpeaker?.recognitionEngine || "fingerprint",
+      speakerRecognitionEngine: manualSpeakerName ? null : detectedSpeaker?.recognitionEngine || "none",
       speakerEmbeddingEnabled: !!speakerEmbeddingServiceUrl,
       speakerEmbeddingAvailable: !!speakerEmbedding,
       assemblySpeakerLabel: dominantAssemblySpeakerLabel,
       speakerIdentificationCandidates,
       speakerIdentificationMapping,
+      transcriptionDiagnostics,
       utterances: utterances.map((item) => ({
         speaker: item.speaker || null,
         text: item.text || "",
@@ -1206,6 +1362,10 @@ const executeTranscription = async (req, res, fileLike) => {
       })),
     });
   } catch (error) {
+    console.warn("Transcription failed timing", {
+      totalMs: Date.now() - startedAtMs,
+      steps: timings,
+    });
     const message =
       error && typeof error === "object" && "message" in error
         ? error.message

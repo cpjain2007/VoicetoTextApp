@@ -2,6 +2,8 @@
 
 Cloud Run service for speaker embeddings. It uses SpeechBrain ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`) to turn an audio clip into a normalized speaker embedding.
 
+The Docker image downloads the model during image build and stores it under `/models/speechbrain-spkrec-ecapa-voxceleb`. Runtime requests should not need to download model files from Hugging Face.
+
 ## Local Run
 
 ```powershell
@@ -34,6 +36,7 @@ Then set these on the Firebase API runtime:
 ```powershell
 SPEAKER_EMBEDDING_SERVICE_URL=https://your-cloud-run-url
 SPEAKER_EMBEDDING_SERVICE_TOKEN=replace_with_shared_secret
+SPEAKER_EMBEDDING_TIMEOUT_MS=10000
 ```
 
 The Firebase API will use embeddings first when these variables are configured, and fall back to the existing fingerprint matcher if the service is unavailable.
