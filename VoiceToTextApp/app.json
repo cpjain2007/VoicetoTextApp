@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "VoiceToTextApp",
-    "slug": "VoiceToTextApp",
+    "name": "VoicePower",
+    "slug": "voicepower",
     "version": "1.0.0",
     "runtimeVersion": {
       "policy": "appVersion"
