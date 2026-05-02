@@ -32,7 +32,13 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow VoicePower to use your location for traffic-aware drive times."
+        }
+      ]
     ]
   }
 }

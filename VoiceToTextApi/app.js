@@ -18,6 +18,7 @@ const serverToken =
 const openaiApiKey = process.env.OPENAI_API_KEY;
 const assemblyApiKey = process.env.ASSEMBLYAI_API_KEY;
 const openaiAiModel = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
+const googleMapsApiKey = (process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_DIRECTIONS_API_KEY || "").trim();
 const assemblySpeechModels = ["universal-3-pro", "universal-2"];
 const forcedLanguageCode = process.env.ASSEMBLYAI_FORCE_LANGUAGE_CODE || "";
 const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,te,bn")
@@ -221,6 +222,207 @@ const fetchSpeakerEmbedding = async (audioBuffer, mimeType) => {
   } finally {
     clearTimeout(timeout);
   }
+};
+
+const buildPersonAiSummary = async (speakerName, contextText) => {
+  if (!openaiApiKey || !contextText.trim()) {
+    return "";
+  }
+  const client = getOpenAIClient();
+  if (!client) {
+    return "";
+  }
+  const label =
+    typeof speakerName === "string" && speakerName.trim() ? speakerName.trim().slice(0, 120) : "This speaker";
+
+  const response = await withRetries(
+    () =>
+      client.responses.create({
+        model: openaiAiModel,
+        input: [
+          {
+            role: "system",
+            content:
+              "You write a short spoken briefing about ONE person using only the voice-log excerpts provided. Do not invent facts, names, or events. If the logs are thin or only technical metadata, say so briefly. Use 2–6 short sentences that sound natural when read aloud by a voice assistant—clear, neutral, and friendly. Return strict JSON with a single key narrative (string). No bullet characters or markdown.",
+          },
+          {
+            role: "user",
+            content: `App label for this person: ${label}\n\n---\n${contextText.slice(0, 12000)}`,
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "person_voice_summary",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                narrative: { type: "string" },
+              },
+              required: ["narrative"],
+            },
+          },
+        },
+      }),
+    { label: "OpenAI.buildPersonAiSummary" },
+  );
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return typeof parsed.narrative === "string" ? parsed.narrative.trim() : "";
+};
+
+const buildSpeakerTodayPlan = async (speakerName, dateLabel, contextText) => {
+  if (!openaiApiKey || !contextText.trim()) {
+    return "";
+  }
+  const client = getOpenAIClient();
+  if (!client) {
+    return "";
+  }
+  const label =
+    typeof speakerName === "string" && speakerName.trim() ? speakerName.trim().slice(0, 120) : "This speaker";
+  const when =
+    typeof dateLabel === "string" && dateLabel.trim() ? dateLabel.trim().slice(0, 120) : "the user's local today";
+
+  const response = await withRetries(
+    () =>
+      client.responses.create({
+        model: openaiAiModel,
+        input: [
+          {
+            role: "system",
+            content:
+              "You help with planning for ONE person using voice-app logs. SECTION 1 is that person's clips from the calendar day named in the user message; SECTION 2 is other recent app-wide context (may include other speakers) to ground advice—use it only to clarify steps or dependencies, not to invent new plans. If SECTION 1 clearly has no usable schedule or tasks for that day, respond with narrative exactly: No information for today. Otherwise: in 3–7 short sentences suitable for text-to-speech, say what they appear to be doing that day and concrete steps to get it done. Do not invent addresses or times not supported by the logs. Return strict JSON with key narrative (string). No markdown.",
+          },
+          {
+            role: "user",
+            content: `Calendar day in focus (user's local timezone): ${when}\nApp label for this person: ${label}\n\n---\n${contextText.slice(0, 12000)}`,
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "speaker_today_plan",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                narrative: { type: "string" },
+              },
+              required: ["narrative"],
+            },
+          },
+        },
+      }),
+    { label: "OpenAI.buildSpeakerTodayPlan" },
+  );
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return typeof parsed.narrative === "string" ? parsed.narrative.trim() : "";
+};
+
+const buildExtractDestination = async (contextText) => {
+  if (!openaiApiKey || !contextText.trim()) {
+    return "";
+  }
+  const client = getOpenAIClient();
+  if (!client) {
+    return "";
+  }
+
+  const response = await withRetries(
+    () =>
+      client.responses.create({
+        model: openaiAiModel,
+        input: [
+          {
+            role: "system",
+            content:
+              "From notes and transcripts, extract a single place the user wants to DRIVE or GO TO (street address, building + city, or well-known place name that maps navigation could use). If multiple, pick the clearest trip destination. If none, return an empty destination string. Return strict JSON { destination: string }.",
+          },
+          {
+            role: "user",
+            content: contextText.slice(0, 12000),
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "extract_destination",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                destination: { type: "string" },
+              },
+              required: ["destination"],
+            },
+          },
+        },
+      }),
+    { label: "OpenAI.buildExtractDestination" },
+  );
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return typeof parsed.destination === "string" ? parsed.destination.trim().slice(0, 500) : "";
+};
+
+const fetchDrivingDurationWithTraffic = async (originLat, originLng, destination) => {
+  if (!googleMapsApiKey) {
+    throw new Error("GOOGLE_MAPS_API_KEY is not configured on the server.");
+  }
+  const dest = typeof destination === "string" ? destination.trim() : "";
+  if (!dest) {
+    throw new Error("Missing destination.");
+  }
+  const lat = Number(originLat);
+  const lng = Number(originLng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    throw new Error("Invalid origin coordinates.");
+  }
+
+  const params = new URLSearchParams({
+    origin: `${lat},${lng}`,
+    destination: dest,
+    mode: "driving",
+    departure_time: String(Math.floor(Date.now() / 1000)),
+    traffic_model: "best_guess",
+    key: googleMapsApiKey,
+  });
+  const url = `https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status !== "OK" || !Array.isArray(data.routes) || data.routes.length === 0) {
+    const msg =
+      typeof data.error_message === "string" && data.error_message.trim()
+        ? data.error_message
+        : typeof data.status === "string"
+          ? data.status
+          : "Directions request failed.";
+    throw new Error(msg);
+  }
+  const leg = data.routes[0].legs[0];
+  const baseSec = Number(leg?.duration?.value) || 0;
+  const trafficSecRaw = leg?.duration_in_traffic?.value;
+  const trafficSec = Number.isFinite(Number(trafficSecRaw)) ? Number(trafficSecRaw) : baseSec;
+  const summary =
+    (typeof leg?.duration_in_traffic?.text === "string" && leg.duration_in_traffic.text.trim()
+      ? leg.duration_in_traffic.text
+      : null) ||
+    (typeof leg?.duration?.text === "string" ? leg.duration.text : "") ||
+    "";
+
+  return {
+    durationSeconds: baseSec,
+    durationInTrafficSeconds: trafficSec,
+    summaryText: summary,
+    baselineMinutes: Math.max(1, Math.round(baseSec / 60)),
+    trafficMinutes: Math.max(1, Math.round(trafficSec / 60)),
+  };
 };
 
 const buildAiInsights = async (text) => {
@@ -1497,6 +1699,80 @@ app.post("/ai/insights", async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : "AI insights failed.";
     return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/ai/person-summary", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const speakerName = typeof req.body?.speakerName === "string" ? req.body.speakerName : "";
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text.trim()) {
+      return res.status(400).json({ error: "Missing text bundle for summary." });
+    }
+    const narrative = await buildPersonAiSummary(speakerName, text);
+    if (!narrative) {
+      return res.status(500).json({ error: "Could not generate person summary." });
+    }
+    return res.json({ narrative });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Person summary failed.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/ai/speaker-today-plan", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const speakerName = typeof req.body?.speakerName === "string" ? req.body.speakerName : "";
+    const dateLabel = typeof req.body?.dateLabel === "string" ? req.body.dateLabel : "";
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text.trim()) {
+      return res.status(400).json({ error: "Missing text bundle for today plan." });
+    }
+    const narrative = await buildSpeakerTodayPlan(speakerName, dateLabel, text);
+    if (!narrative) {
+      return res.status(500).json({ error: "Could not generate today's plan." });
+    }
+    return res.json({ narrative });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Today plan failed.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/ai/extract-destination", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text.trim()) {
+      return res.status(400).json({ error: "Missing text to extract destination from." });
+    }
+    const destination = await buildExtractDestination(text);
+    return res.json({ destination });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Destination extraction failed.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/traffic/duration", async (req, res) => {
+  try {
+    const originLat = req.body?.originLat;
+    const originLng = req.body?.originLng;
+    const destination = typeof req.body?.destination === "string" ? req.body.destination : "";
+    const result = await fetchDrivingDurationWithTraffic(originLat, originLng, destination);
+    return res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Traffic lookup failed.";
+    const status = message.includes("not configured") ? 501 : 400;
+    return res.status(status).json({ error: message });
   }
 });
 

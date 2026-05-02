@@ -1,6 +1,7 @@
 import { StatusBar } from "expo-status-bar";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { LinearGradient } from "expo-linear-gradient";
+import * as Location from "expo-location";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
 import * as Speech from "expo-speech";
@@ -9,6 +10,8 @@ import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
+  AppStateStatus,
   Image,
   Modal,
   Platform,
@@ -862,6 +865,130 @@ const buildAiInsightsOverview = (history: TranscriptLogItem[]): AiInsightsOvervi
   };
 };
 
+const MAX_PERSON_SUMMARY_BUNDLE_CHARS = 11000;
+const MAX_TODAY_PLAN_BUNDLE_CHARS = 11000;
+const TRAFFIC_POLL_INTERVAL_MS = 4 * 60 * 1000;
+
+const getLocalDayBoundsMs = () => {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  const label = now.toLocaleDateString(undefined, {
+    weekday: "long",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  return { startMs: start.getTime(), endMs: end.getTime(), label };
+};
+
+const formatLogRowForPlanBundle = (row: TranscriptLogItem) => {
+  const lines: string[] = [`[${row.createdAt}] ${row.speakerName}:`];
+  if (row.text?.trim()) {
+    const t = row.text.trim();
+    lines.push(t.slice(0, 900) + (t.length > 900 ? "…" : ""));
+  }
+  if (row.ai?.summary?.trim()) {
+    const s = row.ai.summary.trim();
+    lines.push(`AI summary: ${s.slice(0, 450)}${s.length > 450 ? "…" : ""}`);
+  }
+  const topics = row.ai?.topics?.filter((x) => x.trim()) ?? [];
+  if (topics.length) {
+    lines.push(`Topics: ${topics.join(", ")}`);
+  }
+  const acts = row.ai?.actionItems?.filter((x) => x.trim()) ?? [];
+  if (acts.length) {
+    lines.push(`Tasks: ${acts.join("; ")}`);
+  }
+  return lines.join("\n");
+};
+
+/** Today's clips for the speaker + other recent log context for POST /ai/speaker-today-plan. */
+const buildTodayPlanBundle = (
+  speakerName: string,
+  history: TranscriptLogItem[],
+): { bundle: string | null; dateLabel: string } => {
+  const { startMs, endMs, label } = getLocalDayBoundsMs();
+  const key = normalizeSpeakerKey(speakerName);
+  if (!key) {
+    return { bundle: null, dateLabel: label };
+  }
+  const sameSpeaker = history.filter(
+    (h) => normalizeSpeakerKey((h.speakerName || "").trim() || UNKNOWN_SPEAKER_LABEL) === key,
+  );
+  const todayRows = sameSpeaker
+    .filter((h) => h.createdAtMs >= startMs && h.createdAtMs <= endMs)
+    .sort((a, b) => b.createdAtMs - a.createdAtMs);
+  if (todayRows.length === 0) {
+    return { bundle: null, dateLabel: label };
+  }
+  const todayIds = new Set(todayRows.map((r) => r.id));
+  const contextRows = history.filter((h) => !todayIds.has(h.id)).slice(0, 30);
+  const s1 = todayRows.map((r) => formatLogRowForPlanBundle(r)).join("\n\n—\n\n");
+  const s2 = contextRows.map((r) => formatLogRowForPlanBundle(r)).join("\n\n—\n\n");
+  let bundle = `SECTION 1 — ${speakerName} on ${label} (today, user's device calendar):\n\n${s1}\n\nSECTION 2 — Other recent app-wide voice logs:\n\n${s2.trim() || "(none)"}`;
+  if (bundle.length > MAX_TODAY_PLAN_BUNDLE_CHARS) {
+    bundle = `${bundle.slice(0, MAX_TODAY_PLAN_BUNDLE_CHARS)}\n…`;
+  }
+  return { bundle, dateLabel: label };
+};
+
+const buildRecentLogsForDestinationExtract = (history: TranscriptLogItem[]) => {
+  return [...history]
+    .sort((a, b) => b.createdAtMs - a.createdAtMs)
+    .slice(0, 20)
+    .map((h) => {
+      const tx = h.text?.trim() || "";
+      const ai = h.ai?.summary?.trim() || "";
+      return `${h.speakerName} (${h.createdAt})\nSaid: ${tx.slice(0, 1200)}${tx.length > 1200 ? "…" : ""}\nAI notes: ${ai.slice(0, 400)}`;
+    })
+    .join("\n\n---\n\n");
+};
+
+/** Concatenate saved clips for one speaker for POST /ai/person-summary. */
+const buildPersonSummaryBundle = (speakerName: string, history: TranscriptLogItem[]): string | null => {
+  const key = normalizeSpeakerKey(speakerName);
+  if (!key) {
+    return null;
+  }
+  const rows = history
+    .filter((h) => normalizeSpeakerKey((h.speakerName || "").trim() || UNKNOWN_SPEAKER_LABEL) === key)
+    .sort((a, b) => b.createdAtMs - a.createdAtMs)
+    .slice(0, 48);
+  if (rows.length === 0) {
+    return null;
+  }
+  const chunks: string[] = [];
+  for (const row of rows) {
+    const lines: string[] = [`Session: ${row.createdAt}`];
+    const t = row.text?.trim() ?? "";
+    if (t) {
+      lines.push(`Transcript: ${t.slice(0, 2500)}${t.length > 2500 ? "…" : ""}`);
+    }
+    const summ = row.ai?.summary?.trim() ?? "";
+    if (summ) {
+      lines.push(`Saved AI summary: ${summ.slice(0, 600)}${summ.length > 600 ? "…" : ""}`);
+    }
+    const topics = row.ai?.topics?.filter((x) => x.trim()) ?? [];
+    if (topics.length > 0) {
+      lines.push(`Topics tagged: ${topics.join(", ")}`);
+    }
+    const acts = row.ai?.actionItems?.filter((x) => x.trim()) ?? [];
+    if (acts.length > 0) {
+      lines.push(`Tasks noted: ${acts.join("; ")}`);
+    }
+    if (row.answeredVoiceFollowUp?.trim()) {
+      lines.push(`They answered an AI follow-up about: ${row.answeredVoiceFollowUp.trim().slice(0, 220)}`);
+    }
+    chunks.push(lines.join("\n"));
+  }
+  let bundle = chunks.join("\n\n———\n\n");
+  if (bundle.length > MAX_PERSON_SUMMARY_BUNDLE_CHARS) {
+    bundle = `${bundle.slice(0, MAX_PERSON_SUMMARY_BUNDLE_CHARS)}\n…`;
+  }
+  return bundle;
+};
+
 const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
   if (!value || typeof value !== "object") {
     return null;
@@ -1007,6 +1134,18 @@ export default function App() {
     voiceFollowUpRef.current = next;
     setVoiceFollowUp(next);
   }, []);
+  const [personSummaryModal, setPersonSummaryModal] = useState<{ speakerName: string; narrative: string } | null>(
+    null,
+  );
+  const [todayPlanModal, setTodayPlanModal] = useState<{ speakerName: string; narrative: string } | null>(null);
+  const [speakerAiLoading, setSpeakerAiLoading] = useState<{ kind: "summary" | "today"; key: string } | null>(null);
+  const [trafficDestinationDraft, setTrafficDestinationDraft] = useState("");
+  const [trafficWatchActive, setTrafficWatchActive] = useState(false);
+  const [trafficStatusLine, setTrafficStatusLine] = useState<string | null>(null);
+  const [trafficFetchBusy, setTrafficFetchBusy] = useState(false);
+  const trafficPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const trafficPrevTrafficMinutesRef = useRef<number | null>(null);
+  const trafficAppStateRef = useRef<AppStateStatus>(AppState.currentState);
   const historyRef = useRef(history);
 
   const closeUnknownSpeakerPrompt = (value: string) => {
@@ -1295,6 +1434,260 @@ export default function App() {
       ],
     );
   };
+
+  const generatePersonVoiceSummary = useCallback(
+    async (speakerName: string) => {
+      const bundle = buildPersonSummaryBundle(speakerName, history);
+      if (!bundle) {
+        Alert.alert(
+          "No clips for this person",
+          `There are no saved log entries for “${speakerName}” yet. Record with this speaker (or merge from the server) first.`,
+        );
+        return;
+      }
+      const loadKey = normalizeSpeakerKey(speakerName);
+      setSpeakerAiLoading({ kind: "summary", key: loadKey });
+      setErrorText(null);
+      try {
+        const apiToken = expoTranscribeBearerToken();
+        const response = await fetch(`${getApiBaseUrl()}/ai/person-summary`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+          },
+          body: JSON.stringify({ speakerName, text: bundle }),
+        });
+        const raw = await response.text();
+        if (!response.ok) {
+          let detail = raw || `HTTP ${response.status}`;
+          try {
+            const j = JSON.parse(raw) as { error?: string };
+            if (typeof j.error === "string" && j.error.trim()) {
+              detail = j.error.trim();
+            }
+          } catch {
+            /* use raw text */
+          }
+          throw new Error(detail);
+        }
+        const data = JSON.parse(raw) as { narrative?: string };
+        const narrative = typeof data.narrative === "string" ? data.narrative.trim() : "";
+        if (!narrative) {
+          throw new Error("Empty summary from server.");
+        }
+        Speech.stop();
+        setPersonSummaryModal({ speakerName, narrative });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Could not generate summary.";
+        setErrorText(msg);
+        Alert.alert("Voice summary failed", msg);
+      } finally {
+        setSpeakerAiLoading(null);
+      }
+    },
+    [history],
+  );
+
+  const generateTodayPlanForSpeaker = useCallback(
+    async (speakerName: string) => {
+      const { bundle, dateLabel } = buildTodayPlanBundle(speakerName, history);
+      if (!bundle) {
+        Speech.stop();
+        setTodayPlanModal({ speakerName, narrative: "No information for today." });
+        return;
+      }
+      const loadKey = normalizeSpeakerKey(speakerName);
+      setSpeakerAiLoading({ kind: "today", key: loadKey });
+      setErrorText(null);
+      try {
+        const apiToken = expoTranscribeBearerToken();
+        const response = await fetch(`${getApiBaseUrl()}/ai/speaker-today-plan`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+          },
+          body: JSON.stringify({ speakerName, dateLabel, text: bundle }),
+        });
+        const raw = await response.text();
+        if (!response.ok) {
+          let detail = raw || `HTTP ${response.status}`;
+          try {
+            const j = JSON.parse(raw) as { error?: string };
+            if (typeof j.error === "string" && j.error.trim()) {
+              detail = j.error.trim();
+            }
+          } catch {
+            /* use raw text */
+          }
+          throw new Error(detail);
+        }
+        const data = JSON.parse(raw) as { narrative?: string };
+        const narrative = typeof data.narrative === "string" ? data.narrative.trim() : "";
+        if (!narrative) {
+          throw new Error("Empty plan from server.");
+        }
+        Speech.stop();
+        setTodayPlanModal({ speakerName, narrative });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Could not generate today's plan.";
+        setErrorText(msg);
+        Alert.alert("Today's plan failed", msg);
+      } finally {
+        setSpeakerAiLoading(null);
+      }
+    },
+    [history],
+  );
+
+  const detectDestinationFromLogs = useCallback(async () => {
+    const text = buildRecentLogsForDestinationExtract(history);
+    if (!text.trim()) {
+      Alert.alert("No logs", "Record something first so we can look for a place to go.");
+      return;
+    }
+    setTrafficFetchBusy(true);
+    setErrorText(null);
+    try {
+      const apiToken = expoTranscribeBearerToken();
+      const response = await fetch(`${getApiBaseUrl()}/ai/extract-destination`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        },
+        body: JSON.stringify({ text }),
+      });
+      const raw = await response.text();
+      if (!response.ok) {
+        let detail = raw || `HTTP ${response.status}`;
+        try {
+          const j = JSON.parse(raw) as { error?: string };
+          if (typeof j.error === "string" && j.error.trim()) {
+            detail = j.error.trim();
+          }
+        } catch {
+          /* */
+        }
+        throw new Error(detail);
+      }
+      const data = JSON.parse(raw) as { destination?: string };
+      const dest = typeof data.destination === "string" ? data.destination.trim() : "";
+      if (!dest) {
+        Alert.alert("No destination found", "Try typing an address or place name, or mention where you're going in a new clip.");
+        return;
+      }
+      setTrafficDestinationDraft(dest);
+      setTrafficStatusLine(`Using: ${dest}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not detect destination.";
+      setErrorText(msg);
+      Alert.alert("Extract failed", msg);
+    } finally {
+      setTrafficFetchBusy(false);
+    }
+  }, [history]);
+
+  const runOneTrafficCheck = useCallback(async () => {
+    const dest = trafficDestinationDraft.trim();
+    if (!dest) {
+      return;
+    }
+    if (Platform.OS === "web") {
+      setTrafficStatusLine("Traffic watch needs a dev build on device (location + Maps).");
+      return;
+    }
+    setTrafficFetchBusy(true);
+    try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (perm.status !== "granted") {
+        throw new Error("Location permission is needed for drive times.");
+      }
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const apiToken = expoTranscribeBearerToken();
+      const response = await fetch(`${getApiBaseUrl()}/traffic/duration`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        },
+        body: JSON.stringify({
+          originLat: pos.coords.latitude,
+          originLng: pos.coords.longitude,
+          destination: dest,
+        }),
+      });
+      const raw = await response.text();
+      if (!response.ok) {
+        let detail = raw || `HTTP ${response.status}`;
+        try {
+          const j = JSON.parse(raw) as { error?: string };
+          if (typeof j.error === "string" && j.error.trim()) {
+            detail = j.error.trim();
+          }
+        } catch {
+          /* */
+        }
+        throw new Error(detail);
+      }
+      const data = JSON.parse(raw) as { trafficMinutes?: number; baselineMinutes?: number; summaryText?: string };
+      const tm = typeof data.trafficMinutes === "number" ? data.trafficMinutes : null;
+      const summary = typeof data.summaryText === "string" ? data.summaryText : "";
+      if (tm === null) {
+        throw new Error("Bad traffic response.");
+      }
+      const line = summary ? `${summary} (~${tm} min with traffic)` : `About ${tm} minutes with current traffic.`;
+      setTrafficStatusLine(line);
+
+      const prev = trafficPrevTrafficMinutesRef.current;
+      trafficPrevTrafficMinutesRef.current = tm;
+      if (prev !== null && tm > prev * 1.2 && tm - prev >= 3) {
+        const msg = `Heavier traffic now: about ${tm} minutes, was about ${prev}.`;
+        Speech.stop();
+        Speech.speak(msg, { language: "en-US", rate: Platform.OS === "ios" ? 0.92 : 1 });
+        Alert.alert("Traffic update", msg);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Traffic check failed.";
+      setTrafficStatusLine(msg);
+      if (trafficWatchActive) {
+        setErrorText(msg);
+      }
+    } finally {
+      setTrafficFetchBusy(false);
+    }
+  }, [trafficDestinationDraft, trafficWatchActive]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next) => {
+      trafficAppStateRef.current = next;
+    });
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!trafficWatchActive || !trafficDestinationDraft.trim()) {
+      if (trafficPollTimerRef.current) {
+        clearInterval(trafficPollTimerRef.current);
+        trafficPollTimerRef.current = null;
+      }
+      trafficPrevTrafficMinutesRef.current = null;
+      return;
+    }
+    void runOneTrafficCheck();
+    trafficPollTimerRef.current = setInterval(() => {
+      if (trafficAppStateRef.current === "active") {
+        void runOneTrafficCheck();
+      }
+    }, TRAFFIC_POLL_INTERVAL_MS);
+    return () => {
+      if (trafficPollTimerRef.current) {
+        clearInterval(trafficPollTimerRef.current);
+        trafficPollTimerRef.current = null;
+      }
+    };
+  }, [trafficWatchActive, trafficDestinationDraft, runOneTrafficCheck]);
 
   const fetchSpeakers = async (suppressError = false) => {
     try {
@@ -2168,6 +2561,118 @@ export default function App() {
           </View>
         </View>
       </Modal>
+      <Modal
+        visible={personSummaryModal !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          Speech.stop();
+          setPersonSummaryModal(null);
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={() => {
+              Speech.stop();
+              setPersonSummaryModal(null);
+            }}
+          />
+          <View style={[styles.modalCard, styles.personSummaryModalCard]}>
+            <Text style={styles.modalTitle}>AI voice summary</Text>
+            <Text style={styles.modalSubtitle}>
+              {personSummaryModal ? `About “${personSummaryModal.speakerName}” from your saved logs.` : ""}
+            </Text>
+            <ScrollView style={styles.personSummaryScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+              <Text style={styles.personSummaryBody} selectable>
+                {personSummaryModal?.narrative ?? ""}
+              </Text>
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => {
+                  Speech.stop();
+                  setPersonSummaryModal(null);
+                }}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Close</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                onPress={() => {
+                  if (!personSummaryModal?.narrative) {
+                    return;
+                  }
+                  Speech.stop();
+                  Speech.speak(personSummaryModal.narrative, {
+                    language: "en-US",
+                    rate: Platform.OS === "ios" ? 0.92 : 1,
+                  });
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Play aloud</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={todayPlanModal !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          Speech.stop();
+          setTodayPlanModal(null);
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={() => {
+              Speech.stop();
+              setTodayPlanModal(null);
+            }}
+          />
+          <View style={[styles.modalCard, styles.personSummaryModalCard]}>
+            <Text style={styles.modalTitle}>Today’s plan</Text>
+            <Text style={styles.modalSubtitle}>
+              {todayPlanModal ? `For “${todayPlanModal.speakerName}” (${getLocalDayBoundsMs().label}).` : ""}
+            </Text>
+            <ScrollView style={styles.personSummaryScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+              <Text style={styles.personSummaryBody} selectable>
+                {todayPlanModal?.narrative ?? ""}
+              </Text>
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => {
+                  Speech.stop();
+                  setTodayPlanModal(null);
+                }}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Close</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                onPress={() => {
+                  if (!todayPlanModal?.narrative) {
+                    return;
+                  }
+                  Speech.stop();
+                  Speech.speak(todayPlanModal.narrative, {
+                    language: "en-US",
+                    rate: Platform.OS === "ios" ? 0.92 : 1,
+                  });
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Play aloud</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <View style={styles.card}>
         <View style={styles.cardHeaderRow}>
           <View style={styles.cardHeaderMain}>
@@ -2588,7 +3093,8 @@ export default function App() {
               <Text style={styles.panelTitle}>Known Speakers</Text>
               <Text style={styles.speakerListHelp}>
                 Show Records lists each enrollment. Fingerprint = 12-D audio stats; embedding = ECAPA speaker
-                vector when saved.
+                vector when saved. Calendar = spoken today plan from today’s clips; sparkles = recap from all their
+                clips.
               </Text>
               {isLoadingSpeakers ? (
                 <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
@@ -2615,6 +3121,42 @@ export default function App() {
                           )}
                         </View>
                         <View style={styles.speakerListActions}>
+                          <View style={styles.speakerListActionsInner}>
+                            <Pressable
+                              style={styles.personSummaryIconButton}
+                              onPress={() => void generateTodayPlanForSpeaker(speaker.name)}
+                              disabled={
+                                speakerAiLoading?.kind === "today" &&
+                                speakerAiLoading.key === normalizeSpeakerKey(speaker.name)
+                              }
+                              accessibilityRole="button"
+                              accessibilityLabel={`Today's AI plan for ${speaker.name}`}
+                            >
+                              {speakerAiLoading?.kind === "today" &&
+                              speakerAiLoading.key === normalizeSpeakerKey(speaker.name) ? (
+                                <ActivityIndicator size="small" color="#0f766e" />
+                              ) : (
+                                <Ionicons name="calendar-outline" size={22} color="#0f766e" />
+                              )}
+                            </Pressable>
+                            <Pressable
+                              style={styles.personSummaryIconButton}
+                              onPress={() => void generatePersonVoiceSummary(speaker.name)}
+                              disabled={
+                                speakerAiLoading?.kind === "summary" &&
+                                speakerAiLoading.key === normalizeSpeakerKey(speaker.name)
+                              }
+                              accessibilityRole="button"
+                              accessibilityLabel={`AI voice summary for ${speaker.name}`}
+                            >
+                              {speakerAiLoading?.kind === "summary" &&
+                              speakerAiLoading.key === normalizeSpeakerKey(speaker.name) ? (
+                                <ActivityIndicator size="small" color="#0f766e" />
+                              ) : (
+                                <Ionicons name="sparkles" size={22} color="#0f766e" />
+                              )}
+                            </Pressable>
+                            <View style={styles.speakerListActionLinks}>
                           <Pressable onPress={() => openSpeakerHintModal(speaker)}>
                             <Text style={styles.speakerListEdit}>Edit Hint</Text>
                           </Pressable>
@@ -2635,6 +3177,8 @@ export default function App() {
                                   : `Show ${sampleCount} Records`}
                             </Text>
                           </Pressable>
+                            </View>
+                          </View>
                         </View>
                       </View>
 
@@ -2800,6 +3344,59 @@ export default function App() {
               ) : null}
             </View>
 
+            <View style={styles.aiSectionPanel}>
+              <Text style={styles.aiSectionHeading}>Drive-time watch</Text>
+              <Text style={styles.aiSectionSub}>
+                Re-checks about every 4 minutes while the app is open. If time in traffic jumps roughly 20%+ (and at
+                least 3 minutes), you get a spoken alert. Set GOOGLE_MAPS_API_KEY on the API (Directions enabled).
+              </Text>
+              <TextInput
+                style={styles.trafficDestinationInput}
+                placeholder="Destination address or place"
+                placeholderTextColor="#94a3b8"
+                value={trafficDestinationDraft}
+                onChangeText={setTrafficDestinationDraft}
+                editable={!trafficWatchActive}
+              />
+              <View style={styles.trafficButtonRow}>
+                <Pressable
+                  style={[styles.trafficSecondaryButton, trafficFetchBusy && styles.controlDisabled]}
+                  disabled={trafficFetchBusy}
+                  onPress={() => void detectDestinationFromLogs()}
+                >
+                  <Text style={styles.trafficSecondaryButtonText}>Detect from logs</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.trafficSecondaryButton, (trafficFetchBusy || !trafficDestinationDraft.trim()) && styles.controlDisabled]}
+                  disabled={trafficFetchBusy || !trafficDestinationDraft.trim()}
+                  onPress={() => void runOneTrafficCheck()}
+                >
+                  <Text style={styles.trafficSecondaryButtonText}>Check now</Text>
+                </Pressable>
+              </View>
+              <Pressable
+                style={[styles.trafficPrimaryButton, trafficFetchBusy && styles.controlDisabled]}
+                disabled={trafficFetchBusy}
+                onPress={() => {
+                  setTrafficWatchActive((active) => {
+                    if (active) {
+                      Speech.stop();
+                    }
+                    return !active;
+                  });
+                }}
+              >
+                <Text style={styles.trafficPrimaryButtonText}>
+                  {trafficWatchActive ? "Stop traffic updates" : "Start traffic updates"}
+                </Text>
+              </Pressable>
+              {trafficStatusLine ? (
+                <Text style={styles.trafficStatusText} selectable>
+                  {trafficStatusLine}
+                </Text>
+              ) : null}
+            </View>
+
             {aiInsightsOverview.allTopics.length > 0 ? (
               <View style={styles.aiSectionPanel}>
                 <Text style={styles.aiSectionHeading}>Topics across everyone</Text>
@@ -2883,12 +3480,53 @@ export default function App() {
             {aiInsightsOverview.bySpeaker.length > 0 ? (
               <View style={styles.aiSectionPanel}>
                 <Text style={styles.aiSectionHeading}>By speaker</Text>
-                <Text style={styles.aiSectionSub}>Per-person topics, tasks, and latest summaries.</Text>
+                <Text style={styles.aiSectionSub}>
+                  Per-person AI: calendar = today’s plan from today’s clips (other logs as context); sparkles = briefing
+                  from all their clips.
+                </Text>
                 {aiInsightsOverview.bySpeaker.map((rollup) => (
                   <View key={rollup.speakerName} style={styles.aiSpeakerCard}>
                     <View style={styles.aiSpeakerCardHeader}>
-                      <Text style={styles.aiSpeakerCardTitle}>{rollup.speakerName}</Text>
-                      <Text style={styles.aiSpeakerCardCount}>{rollup.entryCount} with AI</Text>
+                      <View style={styles.aiSpeakerCardTitleBlock}>
+                        <Text style={styles.aiSpeakerCardTitle}>{rollup.speakerName}</Text>
+                        <Text style={styles.aiSpeakerCardCount}>{rollup.entryCount} with AI</Text>
+                      </View>
+                      <View style={styles.speakerCardIconRow}>
+                        <Pressable
+                          style={styles.personSummaryIconButton}
+                          onPress={() => void generateTodayPlanForSpeaker(rollup.speakerName)}
+                          disabled={
+                            speakerAiLoading?.kind === "today" &&
+                            speakerAiLoading.key === normalizeSpeakerKey(rollup.speakerName)
+                          }
+                          accessibilityRole="button"
+                          accessibilityLabel={`Today's plan for ${rollup.speakerName}`}
+                        >
+                          {speakerAiLoading?.kind === "today" &&
+                          speakerAiLoading.key === normalizeSpeakerKey(rollup.speakerName) ? (
+                            <ActivityIndicator size="small" color="#0f766e" />
+                          ) : (
+                            <Ionicons name="calendar-outline" size={22} color="#0f766e" />
+                          )}
+                        </Pressable>
+                        <Pressable
+                          style={styles.personSummaryIconButton}
+                          onPress={() => void generatePersonVoiceSummary(rollup.speakerName)}
+                          disabled={
+                            speakerAiLoading?.kind === "summary" &&
+                            speakerAiLoading.key === normalizeSpeakerKey(rollup.speakerName)
+                          }
+                          accessibilityRole="button"
+                          accessibilityLabel={`Generate voice summary for ${rollup.speakerName}`}
+                        >
+                          {speakerAiLoading?.kind === "summary" &&
+                          speakerAiLoading.key === normalizeSpeakerKey(rollup.speakerName) ? (
+                            <ActivityIndicator size="small" color="#0f766e" />
+                          ) : (
+                            <Ionicons name="sparkles" size={22} color="#0f766e" />
+                          )}
+                        </Pressable>
+                      </View>
                     </View>
                     {rollup.topics.length > 0 ? (
                       <View style={styles.aiChipWrap}>
@@ -3208,11 +3846,77 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     gap: 8,
   },
+  aiSpeakerCardTitleBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  personSummaryIconButton: {
+    padding: 8,
+    borderRadius: 12,
+    backgroundColor: "rgba(204, 251, 241, 0.75)",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+  },
+  speakerCardIconRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  trafficDestinationInput: {
+    marginTop: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+    backgroundColor: "rgba(255, 255, 255, 0.95)",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: "#1e293b",
+  },
+  trafficButtonRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 10,
+  },
+  trafficSecondaryButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.9)",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+  },
+  trafficSecondaryButtonText: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  trafficPrimaryButton: {
+    marginTop: 10,
+    paddingVertical: 11,
+    borderRadius: 12,
+    backgroundColor: "#14b8a6",
+    borderWidth: 1,
+    borderColor: "rgba(204, 251, 241, 0.9)",
+    alignItems: "center",
+  },
+  trafficPrimaryButtonText: {
+    color: "#ffffff",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  trafficStatusText: {
+    marginTop: 10,
+    color: "#334155",
+    fontSize: 13,
+    lineHeight: 20,
+    fontWeight: "600",
+  },
   aiSpeakerCardTitle: {
     color: "#0f172a",
     fontSize: 16,
     fontWeight: "800",
-    flex: 1,
   },
   aiSpeakerCardCount: {
     color: "#0f766e",
@@ -3864,6 +4568,15 @@ const styles = StyleSheet.create({
     alignItems: "flex-end",
     gap: 8,
   },
+  speakerListActionsInner: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+  },
+  speakerListActionLinks: {
+    alignItems: "flex-end",
+    gap: 8,
+  },
   speakerListName: {
     color: "#1e293b",
     fontSize: 13,
@@ -3999,6 +4712,19 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 28,
     elevation: 16,
+  },
+  personSummaryModalCard: {
+    maxHeight: "85%" as const,
+  },
+  personSummaryScroll: {
+    maxHeight: 280,
+    marginTop: 12,
+  },
+  personSummaryBody: {
+    color: "#1e293b",
+    fontSize: 15,
+    lineHeight: 24,
+    fontWeight: "500",
   },
   modalTitle: {
     color: "#134e4a",
