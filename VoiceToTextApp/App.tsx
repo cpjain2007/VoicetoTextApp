@@ -13,6 +13,7 @@ import {
   AppState,
   AppStateStatus,
   Image,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -23,6 +24,15 @@ import {
   TextInput,
   View,
 } from "react-native";
+
+import {
+  ensureContactsPermission,
+  isContactsApiAvailable,
+  searchContactsWithPhones,
+  type ContactPhoneRow,
+} from "./contactLookup";
+import { buildWebSearchQueryForEntry, suggestContactSearchFromTranscript, autoContactSearchQuery } from "./lookupHelpers";
+import { openGoogleSearch } from "./webSearch";
 
 type TranscriptionDiagnosticsPayload = {
   embeddingServiceConfigured: boolean;
@@ -194,6 +204,92 @@ const expoTranscribeBearerToken = () => {
   }
   const t = raw.trim();
   return t.length > 0 ? t : undefined;
+};
+
+/** E.164-style tel URI and a readable display label. */
+const phoneMatchToDisplayAndTel = (raw: string): { display: string; tel: string } | null => {
+  const trimmed = raw.trim();
+  const d = trimmed.replace(/\D/g, "");
+  if (d.length < 10 || d.length > 15) {
+    return null;
+  }
+  if (d.length === 10) {
+    return {
+      display: `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`,
+      tel: `tel:+1${d}`,
+    };
+  }
+  if (d.length === 11 && d.startsWith("1")) {
+    const n = d.slice(1);
+    return {
+      display: `(${n.slice(0, 3)}) ${n.slice(3, 6)}-${n.slice(6)}`,
+      tel: `tel:+${d}`,
+    };
+  }
+  return { display: trimmed, tel: `tel:+${d}` };
+};
+
+const extractPhoneNumbersFromText = (text: string): Array<{ display: string; tel: string }> => {
+  const out: Array<{ display: string; tel: string }> = [];
+  const seen = new Set<string>();
+  if (!text?.trim()) {
+    return out;
+  }
+  const intlRe = /\+[1-9]\d{7,14}\b/g;
+  const usRe =
+    /\b(?:\+1[-.\s]?)?(?:\([0-9]{3}\)|[0-9]{3})[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b/g;
+  const rawMatches: string[] = [];
+  for (const re of [intlRe, usRe]) {
+    const r = new RegExp(re.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = r.exec(text)) !== null) {
+      rawMatches.push(m[0]);
+    }
+  }
+  for (const raw of rawMatches) {
+    const parsed = phoneMatchToDisplayAndTel(raw);
+    if (!parsed || seen.has(parsed.tel)) {
+      continue;
+    }
+    seen.add(parsed.tel);
+    out.push(parsed);
+  }
+  return out;
+};
+
+const collectPhonesFromHistoryItem = (item: TranscriptLogItem): Array<{ display: string; tel: string }> => {
+  const parts: string[] = [item.text];
+  if (item.ai?.summary) {
+    parts.push(item.ai.summary);
+  }
+  if (item.ai?.actionItems?.length) {
+    parts.push(item.ai.actionItems.join("\n"));
+  }
+  if (item.ai?.followUpQuestions?.length) {
+    parts.push(item.ai.followUpQuestions.join("\n"));
+  }
+  if (item.answeredVoiceFollowUp) {
+    parts.push(item.answeredVoiceFollowUp);
+  }
+  return extractPhoneNumbersFromText(parts.join("\n"));
+};
+
+const confirmAndPlacePhoneCall = (displayNumber: string, telUri: string) => {
+  if (Platform.OS === "web") {
+    Alert.alert("Not available", "Phone calls are not supported in this web view.");
+    return;
+  }
+  Alert.alert("Place call?", `Call ${displayNumber}?`, [
+    { text: "Cancel", style: "cancel" },
+    {
+      text: "Call",
+      onPress: () => {
+        void Linking.openURL(telUri).catch(() => {
+          Alert.alert("Could not start call", "Your device may not support dialing from this app. Try copying the number.");
+        });
+      },
+    },
+  ]);
 };
 
 const normalizeSpeakerKey = (value: string) => value.trim().toLowerCase();
@@ -1152,6 +1248,7 @@ export default function App() {
   const [history, setHistory] = useState<TranscriptLogItem[]>([]);
   const [activeTab, setActiveTab] = useState<AppTab>("record");
   const [expandedHistoryIds, setExpandedHistoryIds] = useState<string[]>([]);
+  const [historyAiRegeneratingId, setHistoryAiRegeneratingId] = useState<string | null>(null);
   const [expandedHistorySpeakers, setExpandedHistorySpeakers] = useState<string[]>([]);
   const [expandedHistoryDateGroups, setExpandedHistoryDateGroups] = useState<string[]>([]);
   const [expandedSpeakerNames, setExpandedSpeakerNames] = useState<string[]>([]);
@@ -1191,10 +1288,17 @@ export default function App() {
   const [trafficWatchActive, setTrafficWatchActive] = useState(false);
   const [trafficStatusLine, setTrafficStatusLine] = useState<string | null>(null);
   const [trafficFetchBusy, setTrafficFetchBusy] = useState(false);
+  const [contactLookupVisible, setContactLookupVisible] = useState(false);
+  const [contactLookupQuery, setContactLookupQuery] = useState("");
+  const [contactLookupResults, setContactLookupResults] = useState<ContactPhoneRow[]>([]);
+  const [contactLookupLoading, setContactLookupLoading] = useState(false);
+  const [webSearchVisible, setWebSearchVisible] = useState(false);
+  const [webSearchDraft, setWebSearchDraft] = useState("");
   const trafficPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const trafficPrevTrafficMinutesRef = useRef<number | null>(null);
   const trafficAppStateRef = useRef<AppStateStatus>(AppState.currentState);
   const historyRef = useRef(history);
+  const skipContactLookupFetchRef = useRef(false);
 
   const closeUnknownSpeakerPrompt = (value: string) => {
     setUnknownSpeakerModalVisible(false);
@@ -1218,6 +1322,104 @@ export default function App() {
     }
     return normalizeTranscribeApiBase(apiUrl);
   };
+
+  const openContactLookupFlow = useCallback(async (initialQuery: string) => {
+    if (Platform.OS === "web") {
+      Alert.alert("Contacts", "Search your contacts in the iOS or Android app.");
+      return;
+    }
+    const avail = await isContactsApiAvailable();
+    if (!avail) {
+      Alert.alert("Contacts", "Address book is not available on this device.");
+      return;
+    }
+    const granted = await ensureContactsPermission();
+    if (!granted) {
+      Alert.alert("Permission needed", "Allow contact access to look someone up by name or nickname.");
+      return;
+    }
+    setContactLookupQuery(initialQuery.trim());
+    setContactLookupResults([]);
+    setContactLookupVisible(true);
+  }, []);
+
+  const openWebSearchFlow = useCallback((prefill: string) => {
+    setWebSearchDraft(prefill.trim());
+    setWebSearchVisible(true);
+  }, []);
+
+  const runAutoContactLookupAfterTranscript = useCallback(async (rawText: string) => {
+    const text = rawText.trim();
+    if (!text || Platform.OS === "web") {
+      return;
+    }
+    const q = autoContactSearchQuery(text);
+    if (!q || q.length < 2) {
+      return;
+    }
+    const avail = await isContactsApiAvailable();
+    if (!avail) {
+      return;
+    }
+    const granted = await ensureContactsPermission();
+    if (!granted) {
+      return;
+    }
+    let rows: ContactPhoneRow[];
+    try {
+      rows = await searchContactsWithPhones(q);
+    } catch {
+      return;
+    }
+    if (rows.length === 0) {
+      return;
+    }
+    if (rows.length === 1) {
+      const r = rows[0];
+      confirmAndPlacePhoneCall(`${r.displayName} · ${r.display}`, r.tel);
+      return;
+    }
+    skipContactLookupFetchRef.current = true;
+    setContactLookupQuery(q);
+    setContactLookupResults(rows);
+    setContactLookupLoading(false);
+    setContactLookupVisible(true);
+  }, []);
+
+  useEffect(() => {
+    if (!contactLookupVisible) {
+      return;
+    }
+    if (skipContactLookupFetchRef.current) {
+      skipContactLookupFetchRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void (async () => {
+        setContactLookupLoading(true);
+        try {
+          const rows = await searchContactsWithPhones(contactLookupQuery);
+          if (!cancelled) {
+            setContactLookupResults(rows);
+          }
+        } catch {
+          if (!cancelled) {
+            setContactLookupResults([]);
+            Alert.alert("Contact search failed", "Could not read contacts.");
+          }
+        } finally {
+          if (!cancelled) {
+            setContactLookupLoading(false);
+          }
+        }
+      })();
+    }, 320);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [contactLookupVisible, contactLookupQuery]);
 
   const canShowTranscript = useMemo(() => transcript.length > 0, [transcript]);
   const aiInsightsOverview = useMemo(() => buildAiInsightsOverview(history), [history]);
@@ -1399,6 +1601,70 @@ export default function App() {
       }
     } catch (error) {
       console.warn("Cloud history save failed", error);
+    }
+  };
+
+  const refreshHistoryEntryAi = async (item: TranscriptLogItem) => {
+    const apiToken = expoTranscribeBearerToken();
+    if (!item.text?.trim()) {
+      Alert.alert("Nothing to summarize", "This entry has no transcript text.");
+      return;
+    }
+    setHistoryAiRegeneratingId(item.id);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiToken) {
+      headers.Authorization = `Bearer ${apiToken}`;
+    }
+    const base = getApiBaseUrl();
+    const tryIds = Array.from(
+      new Set(
+        [item.cloudHistoryId, item.id].filter((x): x is string => typeof x === "string" && x.trim().length > 0),
+      ),
+    );
+    const applyAi = (raw: unknown) => {
+      const ai = parseTranscriptAi(raw);
+      if (!ai) {
+        return false;
+      }
+      setHistory((cur) => cur.map((h) => (h.id === item.id ? { ...h, ai } : h)));
+      return true;
+    };
+    try {
+      for (const externalId of tryIds) {
+        const res = await fetch(`${base}/history/regenerate-ai`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ id: externalId }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { history?: { ai?: unknown } };
+          if (applyAi(data.history?.ai)) {
+            return;
+          }
+          continue;
+        }
+        if (res.status !== 404) {
+          const msg = await res.text();
+          throw new Error(msg || `Regenerate failed (${res.status}).`);
+        }
+      }
+      const res2 = await fetch(`${base}/ai/insights`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text: item.text }),
+      });
+      if (!res2.ok) {
+        const msg = await res2.text();
+        throw new Error(msg || `AI insights failed (${res2.status}).`);
+      }
+      const data2 = (await res2.json()) as { ai?: unknown };
+      if (!applyAi(data2.ai)) {
+        throw new Error("No AI content returned.");
+      }
+    } catch (e) {
+      Alert.alert("AI refresh failed", e instanceof Error ? e.message : "Unknown error.");
+    } finally {
+      setHistoryAiRegeneratingId(null);
     }
   };
 
@@ -2163,6 +2429,7 @@ export default function App() {
 
           setTranscript(text);
           setLastSpeakerName(normalizedSpeakerName);
+          void runAutoContactLookupAfterTranscript(text);
           const newHistoryEntry: TranscriptLogItem = {
             id: historyClientId,
             speakerName: normalizedSpeakerName,
@@ -2309,6 +2576,7 @@ export default function App() {
 
         setTranscript(text);
         setLastSpeakerName(normalizedSpeakerName);
+        void runAutoContactLookupAfterTranscript(text);
         const pass1RecognitionEngine = firstPassEngineFromTranscriptionResult(result);
         const newHistoryEntry: TranscriptLogItem = {
           id: historyClientId,
@@ -2795,6 +3063,114 @@ export default function App() {
           </View>
         </View>
       </Modal>
+      <Modal
+        visible={contactLookupVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setContactLookupVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={() => setContactLookupVisible(false)} />
+          <View style={[styles.modalCard, styles.contactLookupModalCard]}>
+            <Text style={styles.modalTitle}>Contacts</Text>
+            <Text style={styles.modalSubtitle}>
+              We also search automatically after lines like “call …” when contact access is allowed. Or type a name here.
+              Tap a number to call — you confirm before the dialer opens.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Name, nickname, initials…"
+              placeholderTextColor="#94a3b8"
+              value={contactLookupQuery}
+              onChangeText={setContactLookupQuery}
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+            {contactLookupLoading ? (
+              <ActivityIndicator style={{ marginVertical: 12 }} color="#0f766e" />
+            ) : (
+              <ScrollView
+                style={styles.contactLookupScroll}
+                nestedScrollEnabled
+                keyboardShouldPersistTaps="handled"
+              >
+                {contactLookupResults.length === 0 ? (
+                  <Text style={styles.contactLookupEmpty}>
+                    {contactLookupQuery.trim() ? "No matching contacts with phone numbers." : "Type to search."}
+                  </Text>
+                ) : (
+                  contactLookupResults.map((row) => (
+                    <Pressable
+                      key={`${row.contactId}-${row.tel}`}
+                      style={styles.contactLookupRow}
+                      onPress={() =>
+                        confirmAndPlacePhoneCall(`${row.displayName} · ${row.display}`, row.tel)
+                      }
+                      accessibilityRole="button"
+                      accessibilityLabel={`Call ${row.displayName}`}
+                    >
+                      <View style={styles.contactLookupRowText}>
+                        <Text style={styles.contactLookupName}>{row.displayName}</Text>
+                        <Text style={styles.contactLookupMeta}>
+                          {row.phoneLabel} · {row.display}
+                        </Text>
+                      </View>
+                      <Ionicons name="call-outline" size={20} color="#0f766e" />
+                    </Pressable>
+                  ))
+                )}
+              </ScrollView>
+            )}
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                onPress={() => setContactLookupVisible(false)}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={webSearchVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setWebSearchVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={() => setWebSearchVisible(false)} />
+          <View style={[styles.modalCard, styles.contactLookupModalCard]}>
+            <Text style={styles.modalTitle}>Search the web</Text>
+            <Text style={styles.modalSubtitle}>Opens your browser (e.g. Google). Edit the query if you like.</Text>
+            <TextInput
+              style={[styles.modalInput, styles.webSearchInputMultiline]}
+              placeholder="What to search…"
+              placeholderTextColor="#94a3b8"
+              value={webSearchDraft}
+              onChangeText={setWebSearchDraft}
+              multiline
+            />
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => setWebSearchVisible(false)}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                onPress={() => {
+                  openGoogleSearch(webSearchDraft);
+                  setWebSearchVisible(false);
+                }}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Search</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <View style={styles.card}>
         <View style={styles.cardHeaderRow}>
           <View style={styles.cardHeaderMain}>
@@ -2996,6 +3372,30 @@ export default function App() {
                     : "Your spoken words will appear here once recognition starts."}
                 </Text>
               </ScrollView>
+              {canShowTranscript ? (
+                <View style={styles.recordDiscoverRow}>
+                  <Pressable
+                    style={styles.historyDiscoverButton}
+                    onPress={() => {
+                      void openContactLookupFlow(suggestContactSearchFromTranscript(transcript));
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Find in contacts from transcript"
+                  >
+                    <Ionicons name="people-outline" size={16} color="#0f766e" />
+                    <Text style={styles.historyDiscoverButtonText}>Find in contacts</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.historyDiscoverButton}
+                    onPress={() => openWebSearchFlow(buildWebSearchQueryForEntry(transcript, null))}
+                    accessibilityRole="button"
+                    accessibilityLabel="Search the web from transcript"
+                  >
+                    <Ionicons name="globe-outline" size={16} color="#0369a1" />
+                    <Text style={styles.historyDiscoverButtonText}>Search web</Text>
+                  </Pressable>
+                </View>
+              ) : null}
             </View>
           </View>
         ) : null}
@@ -3059,12 +3459,30 @@ export default function App() {
                                         <View style={styles.historyDetailsBox}>
                                           <View style={styles.historyMetaRow}>
                                             <Text style={styles.historyTimestamp}>{item.createdAt}</Text>
-                                            <Pressable
-                                              style={styles.deleteLogButton}
-                                              onPress={() => confirmDeleteHistoryItem(item.id)}
-                                            >
-                                              <Text style={styles.deleteLogButtonText}>Delete</Text>
-                                            </Pressable>
+                                            <View style={styles.historyEntryActions}>
+                                              <Pressable
+                                                style={styles.refreshAiButton}
+                                                onPress={() => {
+                                                  void refreshHistoryEntryAi(item);
+                                                }}
+                                                disabled={historyAiRegeneratingId === item.id || !item.text?.trim()}
+                                                accessibilityRole="button"
+                                                accessibilityLabel="Refresh AI summary for this entry"
+                                              >
+                                                <Text style={styles.refreshAiButtonText}>
+                                                  {historyAiRegeneratingId === item.id ? "AI…" : "Refresh AI"}
+                                                </Text>
+                                              </Pressable>
+                                              <Pressable
+                                                style={styles.deleteLogButton}
+                                                onPress={() => confirmDeleteHistoryItem(item.id)}
+                                                disabled={historyAiRegeneratingId === item.id}
+                                                accessibilityRole="button"
+                                                accessibilityLabel="Delete this log"
+                                              >
+                                                <Text style={styles.deleteLogButtonText}>Delete</Text>
+                                              </Pressable>
+                                            </View>
                                           </View>
                                           <Text style={styles.historyAttribution}>
                                             Source: {formatAttributionSource(item.speakerAttributionSource)}
@@ -3185,6 +3603,67 @@ export default function App() {
                                                 {formatHistoryDiagnosticsText(item)}
                                               </Text>
                                             </>
+                                          ) : null}
+                                          {(() => {
+                                            const phones = collectPhonesFromHistoryItem(item);
+                                            if (phones.length === 0) {
+                                              return null;
+                                            }
+                                            return (
+                                              <View style={styles.historyPhoneBlock}>
+                                                <Text style={styles.historySectionLabel}>Phone numbers</Text>
+                                                <Text style={styles.historyPhoneHint}>
+                                                  Tap a number — you’ll be asked before the dialer opens.
+                                                </Text>
+                                                <View style={styles.historyPhoneChips}>
+                                                  {phones.map((p) => (
+                                                    <Pressable
+                                                      key={p.tel}
+                                                      style={styles.historyPhoneChip}
+                                                      onPress={() => confirmAndPlacePhoneCall(p.display, p.tel)}
+                                                      accessibilityRole="button"
+                                                      accessibilityLabel={`Call ${p.display}`}
+                                                    >
+                                                      <Ionicons name="call-outline" size={16} color="#0369a1" />
+                                                      <Text style={styles.historyPhoneChipText}>{p.display}</Text>
+                                                    </Pressable>
+                                                  ))}
+                                                </View>
+                                              </View>
+                                            );
+                                          })()}
+                                          {item.text?.trim() ? (
+                                            <View style={styles.historyDiscoverRow}>
+                                              <Text style={styles.historySectionLabel}>Look up</Text>
+                                              <View style={styles.historyDiscoverActions}>
+                                                <Pressable
+                                                  style={styles.historyDiscoverButton}
+                                                  onPress={() => {
+                                                    void openContactLookupFlow(
+                                                      suggestContactSearchFromTranscript(item.text),
+                                                    );
+                                                  }}
+                                                  accessibilityRole="button"
+                                                  accessibilityLabel="Search contacts for this entry"
+                                                >
+                                                  <Ionicons name="people-outline" size={16} color="#0f766e" />
+                                                  <Text style={styles.historyDiscoverButtonText}>Contacts</Text>
+                                                </Pressable>
+                                                <Pressable
+                                                  style={styles.historyDiscoverButton}
+                                                  onPress={() =>
+                                                    openWebSearchFlow(
+                                                      buildWebSearchQueryForEntry(item.text, item.ai?.summary),
+                                                    )
+                                                  }
+                                                  accessibilityRole="button"
+                                                  accessibilityLabel="Search the web for this entry"
+                                                >
+                                                  <Ionicons name="globe-outline" size={16} color="#0369a1" />
+                                                  <Text style={styles.historyDiscoverButtonText}>Web</Text>
+                                                </Pressable>
+                                              </View>
+                                            </View>
                                           ) : null}
                                           <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
                                         </View>
@@ -4549,6 +5028,144 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 6,
     gap: 10,
+  },
+  historyEntryActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  refreshAiButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#99f6e4",
+    backgroundColor: "#f0fdfa",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  refreshAiButtonText: {
+    color: "#0f766e",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  historyPhoneBlock: {
+    marginTop: 8,
+    marginBottom: 10,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: "#f0f9ff",
+    borderWidth: 1,
+    borderColor: "#bae6fd",
+  },
+  historyPhoneHint: {
+    fontSize: 12,
+    color: "#0369a1",
+    marginBottom: 8,
+    lineHeight: 17,
+  },
+  historyPhoneChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  historyPhoneChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    backgroundColor: "#e0f2fe",
+    borderWidth: 1,
+    borderColor: "#7dd3fc",
+  },
+  historyPhoneChipText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#0c4a6e",
+  },
+  historyDiscoverRow: {
+    marginTop: 10,
+    marginBottom: 8,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.2)",
+  },
+  historyDiscoverActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 6,
+  },
+  historyDiscoverButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.28)",
+  },
+  historyDiscoverButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  recordDiscoverRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingBottom: 12,
+    marginTop: 4,
+  },
+  contactLookupModalCard: {
+    maxHeight: "82%" as const,
+    width: "92%",
+    maxWidth: 440,
+  },
+  contactLookupScroll: {
+    maxHeight: 280,
+    marginTop: 6,
+  },
+  contactLookupEmpty: {
+    color: "#64748b",
+    fontSize: 14,
+    paddingVertical: 16,
+    textAlign: "center",
+  },
+  contactLookupRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#f1f5f9",
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  contactLookupRowText: {
+    flex: 1,
+    marginRight: 10,
+  },
+  contactLookupName: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  contactLookupMeta: {
+    fontSize: 12,
+    color: "#475569",
+    marginTop: 2,
+  },
+  webSearchInputMultiline: {
+    minHeight: 72,
+    textAlignVertical: "top",
   },
   historySpeakerRow: {
     flexDirection: "row",

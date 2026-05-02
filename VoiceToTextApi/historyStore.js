@@ -282,6 +282,83 @@ async function clearAiFromFirestore() {
 
 const useFirestore = () => process.env.SPEAKER_STORE_BACKEND === "firestore";
 
+/**
+ * @typedef {{ kind: "firestore", ref: import("firebase-admin/firestore").DocumentReference, docId: string, entry: Record<string, unknown> }} FirestoreHistoryPointer
+ * @typedef {{ kind: "file", entries: unknown[], index: number, entry: Record<string, unknown> }} FileHistoryPointer
+ */
+
+/**
+ * Locate a history row by Firestore document id or clientId (or file clientId).
+ * @param {string} externalId
+ * @returns {Promise<(FirestoreHistoryPointer|FileHistoryPointer)|null>}
+ */
+async function resolveHistoryEntryPointer(externalId) {
+  const id = typeof externalId === "string" ? externalId.trim() : "";
+  if (!id) {
+    return null;
+  }
+  if (useFirestore()) {
+    const col = historyCollection();
+    const byDoc = await col.doc(id).get();
+    if (byDoc.exists) {
+      return { kind: "firestore", ref: byDoc.ref, docId: byDoc.id, entry: byDoc.data() || {} };
+    }
+    const qSnap = await col.where("clientId", "==", id).limit(1).get();
+    if (qSnap.empty) {
+      return null;
+    }
+    const d = qSnap.docs[0];
+    return { kind: "firestore", ref: d.ref, docId: d.id, entry: d.data() || {} };
+  }
+  let entries = [];
+  try {
+    const raw = await fs.readFile(localHistoryPath(), "utf8");
+    const parsed = JSON.parse(raw);
+    entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+  const idx = entries.findIndex((e) => e && typeof e === "object" && (e.clientId === id || e.id === id));
+  if (idx < 0) {
+    return null;
+  }
+  return { kind: "file", entries, index: idx, entry: entries[idx] };
+}
+
+/**
+ * @param {FirestoreHistoryPointer|FileHistoryPointer} pointer
+ * @param {object} aiRaw
+ */
+async function applyHistoryEntryAi(pointer, aiRaw) {
+  const aiPayload = cleanAiInsights(aiRaw);
+  if (pointer.kind === "firestore") {
+    const { FieldValue } = require("firebase-admin/firestore");
+    if (aiPayload) {
+      await pointer.ref.update({ ai: aiPayload });
+    } else {
+      await pointer.ref.update({ ai: FieldValue.delete() });
+    }
+    return {
+      id: pointer.docId,
+      clientId: typeof pointer.entry?.clientId === "string" ? pointer.entry.clientId : null,
+      ai: aiPayload,
+    };
+  }
+  const nextEntry = { ...pointer.entry };
+  if (aiPayload) {
+    nextEntry.ai = aiPayload;
+  } else {
+    delete nextEntry.ai;
+  }
+  pointer.entries[pointer.index] = nextEntry;
+  await fs.writeFile(localHistoryPath(), JSON.stringify({ entries: pointer.entries }, null, 2), "utf8");
+  const cid = typeof nextEntry.clientId === "string" ? nextEntry.clientId : null;
+  return { id: cid || String(pointer.index), clientId: cid, ai: aiPayload };
+}
+
 module.exports = {
   sanitizeHistoryEntry,
   appendHistoryEntry: async (entry) => {
@@ -293,4 +370,6 @@ module.exports = {
     return useFirestore() ? listFromFirestore(limit) : listFromFile(limit);
   },
   clearAiFromAllHistory: async () => (useFirestore() ? clearAiFromFirestore() : clearAiFromFile()),
+  resolveHistoryEntryPointer,
+  applyHistoryEntryAi,
 };

@@ -17,7 +17,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.voicetotext.app"
+      "bundleIdentifier": "com.voicetotext.app",
+      "infoPlist": {
+        "LSApplicationQueriesSchemes": ["tel", "https", "http"]
+      }
     },
     "android": {
       "package": "com.voicetotext.app",
@@ -37,6 +40,12 @@
         "expo-location",
         {
           "locationWhenInUsePermission": "Allow VoicePower to use your location for traffic-aware drive times."
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow VoicePower to search your contacts when you want to call someone by name."
         }
       ]
     ]

@@ -28,6 +28,14 @@ const normalizeGoogleMapsApiKey = (raw) => {
 };
 const getGoogleMapsApiKey = () =>
   normalizeGoogleMapsApiKey(process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_DIRECTIONS_API_KEY || "");
+const hasUsableAiPayload = (ai) =>
+  ai &&
+  typeof ai === "object" &&
+  ((typeof ai.summary === "string" && ai.summary.trim()) ||
+    (Array.isArray(ai.actionItems) && ai.actionItems.some((item) => typeof item === "string" && item.trim())) ||
+    (Array.isArray(ai.topics) && ai.topics.some((item) => typeof item === "string" && item.trim())) ||
+    (Array.isArray(ai.followUpQuestions) &&
+      ai.followUpQuestions.some((item) => typeof item === "string" && item.trim())));
 const assemblySpeechModels = ["universal-3-pro", "universal-2"];
 const forcedLanguageCode = process.env.ASSEMBLYAI_FORCE_LANGUAGE_CODE || "";
 const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,te,bn")
@@ -510,7 +518,7 @@ const buildAiInsights = async (text) => {
           {
             role: "system",
             content:
-              "You summarize transcripts into concise notes. Return strict JSON with keys summary, actionItems, topics, and followUpQuestions. summary is one short paragraph. actionItems is concrete follow-ups (short strings). topics is 3-8 short topical tags (Title Case). followUpQuestions is 0-3 short, natural questions the user could be asked aloud to supply missing but important details only when clearly needed (examples: full street address for a trip, appointment time, person's full name). Each question must stand alone and sound natural when spoken by a voice assistant. Use an empty array if the transcript is complete enough. If transcript is empty or noise, use empty strings and empty arrays.",
+              "You summarize voice transcripts into concise notes. Return strict JSON with keys summary, actionItems, topics, and followUpQuestions. summary: one short paragraph — mirror what the user wanted (including named places, dishes, or goals). If they ask YOU for factual details you cannot know (restaurant or business address, phone, hours, menu), never invent them. Say clearly they asked for that info and give a practical next step in ordinary language (e.g. search the business name in maps or call them). Do not imply the user failed to provide something they were requesting from the assistant. actionItems: concrete steps (short strings), e.g. Look up [business name] address in Google Maps. topics: 3-8 Title Case tags. followUpQuestions: 0-3 spoken questions ONLY to fill gaps in what the user is trying to plan or record about themselves — e.g. appointment time if they said they are booking but gave no time, or which person if ambiguous. NEVER use followUpQuestions to ask the user for an address, phone number, hours, or other facts they explicitly asked you to find or tell them. If the main point is them wanting location or contact info for a place, followUpQuestions must be []. If transcript is enough, use []. Empty transcript/noise: empty summary, empty arrays.",
           },
           {
             role: "user",
@@ -1414,6 +1422,51 @@ app.post("/history/clear-ai", async (_req, res) => {
   } catch (error) {
     console.error("history/clear-ai failed", error);
     const message = error instanceof Error ? error.message : "Could not clear AI fields from transcript history.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/history/regenerate-ai", async (req, res) => {
+  try {
+    const externalId = typeof req.body?.id === "string" ? req.body.id.trim() : "";
+    if (!externalId) {
+      return res.status(400).json({ error: "Missing id." });
+    }
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const pointer = await historyStore.resolveHistoryEntryPointer(externalId);
+    if (!pointer) {
+      return res.status(404).json({ error: "History entry not found." });
+    }
+    const text = typeof pointer.entry?.text === "string" ? pointer.entry.text.trim() : "";
+    if (!text) {
+      return res.status(400).json({ error: "No transcript text for this entry." });
+    }
+    let ai;
+    try {
+      ai = await buildAiInsights(text);
+    } catch (insightError) {
+      console.warn("OpenAI history regenerate-ai failed", {
+        message: insightError instanceof Error ? insightError.message : String(insightError),
+      });
+      return res.status(502).json({ error: "AI summary generation failed." });
+    }
+    if (!hasUsableAiPayload(ai)) {
+      return res.status(502).json({ error: "Could not generate usable AI summary." });
+    }
+    const saved = await historyStore.applyHistoryEntryAi(pointer, ai);
+    return res.json({
+      ok: true,
+      history: {
+        id: saved.id,
+        ...(saved.clientId ? { clientId: saved.clientId } : {}),
+        ai: saved.ai || ai,
+      },
+    });
+  } catch (error) {
+    console.error("history/regenerate-ai failed", error);
+    const message = error instanceof Error ? error.message : "Could not regenerate AI for this history entry.";
     return res.status(500).json({ error: message });
   }
 });
