@@ -59,10 +59,13 @@ Response:
   ],
   "ai": {
     "summary": "Short summary",
-    "actionItems": ["Item 1", "Item 2"]
+    "actionItems": ["Item 1", "Item 2"],
+    "topics": ["Scheduling", "Follow-up"]
   }
 }
 ```
+
+`ai` is included when `OPENAI_API_KEY` is set (otherwise omitted). The same shape is **sanitized and stored** on each **`POST /history`** entry under `ai`. If the client omits `ai` but sends `text`, the server runs the model once and backfills before save.
 
 AI insights endpoint:
 
@@ -87,6 +90,12 @@ EXPO_PUBLIC_TRANSCRIBE_API_TOKEN=your_custom_token_here
 ```
 
 Then restart Expo (`npm start`).
+
+**AI tab checklist (3 steps)**
+
+1. **Server:** Set a real `OPENAI_API_KEY` in `VoiceToTextApi/.env` (and in Firebase Functions env when deployed). Verify: `cd VoiceToTextApi && npm run verify:ai`
+2. **App:** Set `EXPO_PUBLIC_TRANSCRIBE_API_URL` and optional token in `VoiceToTextApp/.env` as above. Verify: `cd VoiceToTextApp && npm run verify:env`
+3. **Device:** Open the app’s **AI** tab — it backfills `/ai/insights` for recent clips missing an `ai` block; new recordings receive `ai` from `/transcribe-base64` when the key is set.
 
 ## 4) Deploy as Firebase Cloud Functions (Gen 2)
 

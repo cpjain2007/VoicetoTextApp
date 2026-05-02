@@ -96,6 +96,36 @@ const cleanAttributionSource = (value) => {
   return allowed.has(value) ? value : "unknown";
 };
 
+const cleanStringList = (value, maxItems, itemMaxLen) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, maxItems)
+    .map((item) => cleanString(item, itemMaxLen))
+    .filter((item) => item.length > 0);
+};
+
+/** Normalized AI payload persisted on each history entry (from transcribe or POST /history). */
+const cleanAiInsights = (value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const summary = cleanString(value.summary, 4000);
+  const actionItems = cleanStringList(value.actionItems, 24, 400);
+  const topics = cleanStringList(value.topics, 16, 64);
+  const followUpQuestions = cleanStringList(value.followUpQuestions, 5, 280);
+  if (!summary && actionItems.length === 0 && topics.length === 0 && followUpQuestions.length === 0) {
+    return null;
+  }
+  return {
+    summary,
+    actionItems,
+    topics,
+    ...(followUpQuestions.length > 0 ? { followUpQuestions } : {}),
+  };
+};
+
 const sanitizeHistoryEntry = (entry) => {
   const now = Date.now();
   const createdAtMs = cleanNumber(entry?.createdAtMs) || now;
@@ -104,6 +134,7 @@ const sanitizeHistoryEntry = (entry) => {
   const text = cleanString(entry?.text, 20000);
   const createdAt = cleanString(entry?.createdAt, 80) || new Date(createdAtMs).toISOString();
 
+  const aiPayload = cleanAiInsights(entry?.ai);
   return {
     clientId,
     speakerName,
@@ -125,6 +156,7 @@ const sanitizeHistoryEntry = (entry) => {
     wasVoiceMatchUsed: cleanBoolean(entry?.wasVoiceMatchUsed),
     wasConflictPromptShown: cleanBoolean(entry?.wasConflictPromptShown),
     wasVoiceProfileEnrolled: cleanBoolean(entry?.wasVoiceProfileEnrolled),
+    answeredVoiceFollowUp: cleanNullableString(entry?.answeredVoiceFollowUp, 500),
     firstPassRecognitionEngine: cleanRecognitionEngine(entry?.firstPassRecognitionEngine),
     transcriptionDiagnosticsInitial: cleanHistoryDiagnosticsPayload({
       ...entry?.transcriptionDiagnosticsInitial,
@@ -134,6 +166,7 @@ const sanitizeHistoryEntry = (entry) => {
       ...entry?.transcriptionDiagnosticsEnrollment,
       phase: "enrollment",
     }),
+    ...(aiPayload ? { ai: aiPayload } : {}),
   };
 };
 
@@ -180,6 +213,73 @@ async function listFromFirestore(limit) {
   return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 }
 
+/** Remove AI payloads and voice follow-up tags from every stored history row (file or Firestore). */
+async function clearAiFromFile() {
+  let entries = [];
+  try {
+    const raw = await fs.readFile(localHistoryPath(), "utf8");
+    const parsed = JSON.parse(raw);
+    entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return { cleared: 0, updated: 0, mode: "file" };
+    }
+    throw error;
+  }
+  let updated = 0;
+  const stripped = entries.map((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return entry;
+    }
+    const hadAi = Object.prototype.hasOwnProperty.call(entry, "ai") && entry.ai != null;
+    const hadFollowUp =
+      Object.prototype.hasOwnProperty.call(entry, "answeredVoiceFollowUp") &&
+      entry.answeredVoiceFollowUp != null &&
+      String(entry.answeredVoiceFollowUp).trim() !== "";
+    if (hadAi || hadFollowUp) {
+      updated += 1;
+    }
+    const next = { ...entry };
+    delete next.ai;
+    delete next.answeredVoiceFollowUp;
+    return next;
+  });
+  await fs.writeFile(localHistoryPath(), JSON.stringify({ entries: stripped }, null, 2), "utf8");
+  return { cleared: stripped.length, updated, mode: "file" };
+}
+
+async function clearAiFromFirestore() {
+  const { FieldValue } = require("firebase-admin/firestore");
+  const db = getFirestore();
+  const snap = await historyCollection().get();
+  let batch = db.batch();
+  let ops = 0;
+  let updated = 0;
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    const hadAi = data.ai != null;
+    const hadFollowUp =
+      data.answeredVoiceFollowUp != null && String(data.answeredVoiceFollowUp).trim() !== "";
+    if (hadAi || hadFollowUp) {
+      updated += 1;
+    }
+    batch.update(doc.ref, {
+      ai: FieldValue.delete(),
+      answeredVoiceFollowUp: FieldValue.delete(),
+    });
+    ops += 1;
+    if (ops >= 500) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) {
+    await batch.commit();
+  }
+  return { cleared: snap.size, updated, mode: "firestore" };
+}
+
 const useFirestore = () => process.env.SPEAKER_STORE_BACKEND === "firestore";
 
 module.exports = {
@@ -192,4 +292,5 @@ module.exports = {
     const limit = Math.min(Math.max(Number(rawLimit) || 50, 1), 200);
     return useFirestore() ? listFromFirestore(limit) : listFromFile(limit);
   },
+  clearAiFromAllHistory: async () => (useFirestore() ? clearAiFromFirestore() : clearAiFromFile()),
 };

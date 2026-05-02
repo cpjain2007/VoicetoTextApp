@@ -13,7 +13,8 @@ const historyStore = require("./historyStore");
 const voiceRecognition = require("./voiceRecognition");
 
 const app = express();
-const serverToken = process.env.SERVER_BEARER_TOKEN;
+const serverToken =
+  typeof process.env.SERVER_BEARER_TOKEN === "string" ? process.env.SERVER_BEARER_TOKEN.trim() : "";
 const openaiApiKey = process.env.OPENAI_API_KEY;
 const assemblyApiKey = process.env.ASSEMBLYAI_API_KEY;
 const openaiAiModel = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
@@ -142,7 +143,7 @@ if (serverToken) {
   app.use((req, res, next) => {
     const raw = (req.headers.authorization || "").trim();
     const match = /^Bearer\s+(\S+)/i.exec(raw);
-    const provided = match ? match[1] : "";
+    const provided = match ? match[1].trim() : "";
     if (provided !== serverToken) {
       return res.status(401).json({ error: "Unauthorized." });
     }
@@ -239,7 +240,7 @@ const buildAiInsights = async (text) => {
           {
             role: "system",
             content:
-              "You summarize transcripts into concise business notes. Return strict JSON with keys summary and actionItems. actionItems must be an array of short strings.",
+              "You summarize transcripts into concise notes. Return strict JSON with keys summary, actionItems, topics, and followUpQuestions. summary is one short paragraph. actionItems is concrete follow-ups (short strings). topics is 3-8 short topical tags (Title Case). followUpQuestions is 0-3 short, natural questions the user could be asked aloud to supply missing but important details only when clearly needed (examples: full street address for a trip, appointment time, person's full name). Each question must stand alone and sound natural when spoken by a voice assistant. Use an empty array if the transcript is complete enough. If transcript is empty or noise, use empty strings and empty arrays.",
           },
           {
             role: "user",
@@ -256,8 +257,10 @@ const buildAiInsights = async (text) => {
               properties: {
                 summary: { type: "string" },
                 actionItems: { type: "array", items: { type: "string" } },
+                topics: { type: "array", items: { type: "string" } },
+                followUpQuestions: { type: "array", items: { type: "string" } },
               },
-              required: ["summary", "actionItems"],
+              required: ["summary", "actionItems", "topics", "followUpQuestions"],
             },
           },
         },
@@ -271,6 +274,10 @@ const buildAiInsights = async (text) => {
     summary: typeof parsed.summary === "string" ? parsed.summary : "",
     actionItems: Array.isArray(parsed.actionItems)
       ? parsed.actionItems.filter((item) => typeof item === "string")
+      : [],
+    topics: Array.isArray(parsed.topics) ? parsed.topics.filter((item) => typeof item === "string") : [],
+    followUpQuestions: Array.isArray(parsed.followUpQuestions)
+      ? parsed.followUpQuestions.filter((item) => typeof item === "string")
       : [],
   };
 };
@@ -1097,10 +1104,46 @@ app.get("/history", async (req, res) => {
 
 app.post("/history", async (req, res) => {
   try {
-    const saved = await historyStore.appendHistoryEntry(req.body || {});
+    let payload = req.body && typeof req.body === "object" ? { ...req.body } : {};
+    const text = typeof payload.text === "string" ? payload.text.trim() : "";
+    const clientAi = payload.ai;
+    const hasUsableClientAi =
+      clientAi &&
+      typeof clientAi === "object" &&
+      ((typeof clientAi.summary === "string" && clientAi.summary.trim()) ||
+        (Array.isArray(clientAi.actionItems) &&
+          clientAi.actionItems.some((item) => typeof item === "string" && item.trim())) ||
+        (Array.isArray(clientAi.topics) &&
+          clientAi.topics.some((item) => typeof item === "string" && item.trim())) ||
+        (Array.isArray(clientAi.followUpQuestions) &&
+          clientAi.followUpQuestions.some((item) => typeof item === "string" && item.trim())));
+    if (!hasUsableClientAi && text && openaiApiKey) {
+      try {
+        const generated = await buildAiInsights(text);
+        if (generated) {
+          payload = { ...payload, ai: generated };
+        }
+      } catch (insightError) {
+        console.warn("OpenAI history backfill failed", {
+          message: insightError instanceof Error ? insightError.message : String(insightError),
+        });
+      }
+    }
+    const saved = await historyStore.appendHistoryEntry(payload);
     return res.status(201).json({ ok: true, history: saved });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not save transcript history.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/history/clear-ai", async (_req, res) => {
+  try {
+    const result = await historyStore.clearAiFromAllHistory();
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("history/clear-ai failed", error);
+    const message = error instanceof Error ? error.message : "Could not clear AI fields from transcript history.";
     return res.status(500).json({ error: message });
   }
 });
@@ -1339,6 +1382,17 @@ const executeTranscription = async (req, res, fileLike) => {
       timingSteps: timings.map((item) => ({ step: item.step, ms: item.ms })),
     };
 
+    let aiInsights = null;
+    if (openaiApiKey && transcriptText.trim()) {
+      try {
+        aiInsights = await buildAiInsights(transcriptText);
+      } catch (insightError) {
+        console.warn("OpenAI transcript insights failed", {
+          message: insightError instanceof Error ? insightError.message : String(insightError),
+        });
+      }
+    }
+
     return res.json({
       text: transcriptText,
       enrolledSpeakerName,
@@ -1354,6 +1408,7 @@ const executeTranscription = async (req, res, fileLike) => {
       speakerIdentificationCandidates,
       speakerIdentificationMapping,
       transcriptionDiagnostics,
+      ...(aiInsights ? { ai: aiInsights } : {}),
       utterances: utterances.map((item) => ({
         speaker: item.speaker || null,
         text: item.text || "",

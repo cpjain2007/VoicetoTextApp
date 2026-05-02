@@ -1,8 +1,9 @@
 import { StatusBar } from "expo-status-bar";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { LinearGradient } from "expo-linear-gradient";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
+import * as Speech from "expo-speech";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
 import {
@@ -42,6 +43,14 @@ type TranscriptionDiagnosticsPhase = TranscriptionDiagnosticsPayload & {
   phase: "transcribe" | "enrollment";
 };
 
+type TranscriptAiInsights = {
+  summary: string;
+  actionItems: string[];
+  topics: string[];
+  /** Short questions the app may read aloud so the user can answer by voice (e.g. missing address). */
+  followUpQuestions?: string[];
+};
+
 type TranscriptLogItem = {
   id: string;
   speakerName: string;
@@ -72,6 +81,10 @@ type TranscriptLogItem = {
   transcriptionDiagnosticsInitial?: TranscriptionDiagnosticsPhase | null;
   /** Present when unknown-speaker flow re-uploaded audio with a name (enrollment). */
   transcriptionDiagnosticsEnrollment?: TranscriptionDiagnosticsPhase | null;
+  /** AI summary, action items, and topics (from transcribe or cloud history). */
+  ai?: TranscriptAiInsights | null;
+  /** When set, this clip was recorded as a spoken answer to an AI voice follow-up question. */
+  answeredVoiceFollowUp?: string | null;
 };
 
 type TranscriptionResult = {
@@ -87,6 +100,8 @@ type TranscriptionResult = {
   speakerEmbeddingEnabled?: boolean;
   speakerEmbeddingAvailable?: boolean;
   transcriptionDiagnostics?: TranscriptionDiagnosticsPayload | null;
+  /** From /transcribe-base64 when the API has OPENAI_API_KEY. */
+  ai?: TranscriptAiInsights | null;
 };
 
 type NumericVectorPayload = {
@@ -139,7 +154,24 @@ type SpeakerAttributionSource =
   | "speaker_conflict_prompt"
   | "unknown";
 
-type AppTab = "record" | "history" | "speakers";
+type AppTab = "record" | "history" | "speakers" | "ai";
+
+type AiSpeakerRollup = {
+  speakerName: string;
+  entryCount: number;
+  topics: Array<{ display: string; count: number }>;
+  actionItems: string[];
+  summaries: Array<{ text: string; createdAt: string }>;
+};
+
+type AiInsightsOverview = {
+  totalEntries: number;
+  entriesWithAi: number;
+  allTopics: Array<{ display: string; count: number }>;
+  actionItems: Array<{ text: string; speaker: string; createdAt: string }>;
+  bySpeaker: AiSpeakerRollup[];
+  voiceFollowUps: Array<{ question: string; speaker: string; createdAt: string; historyId: string }>;
+};
 
 const HISTORY_STORAGE_KEY = "voicetotext.history.v1";
 const UNKNOWN_SPEAKER_LABEL = "Unknown speaker";
@@ -147,6 +179,19 @@ const UNKNOWN_SPEAKER_NAME_MAX_CHARS = 80;
 
 /** Matches default `ASSEMBLYAI_SPEAKER_DESCRIPTION_MAX` on the API. */
 const SPEAKER_DESCRIPTION_MAX_CHARS = 220;
+
+/** Origin for `/history`, `/transcribe-base64`, etc. No trailing slash; strips optional `…/transcribe`. */
+const normalizeTranscribeApiBase = (apiUrl: string) =>
+  apiUrl.trim().replace(/\/transcribe\/?$/i, "").replace(/\/+$/, "");
+
+const expoTranscribeBearerToken = () => {
+  const raw = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const t = raw.trim();
+  return t.length > 0 ? t : undefined;
+};
 
 const normalizeSpeakerKey = (value: string) => value.trim().toLowerCase();
 
@@ -628,6 +673,195 @@ const readAttributionSource = (value: unknown): SpeakerAttributionSource | undef
   return undefined;
 };
 
+const pickFirstFollowUpQuestion = (ai: TranscriptAiInsights | null | undefined) => {
+  const list = ai?.followUpQuestions;
+  if (!Array.isArray(list)) {
+    return null;
+  }
+  const q = list.map((s) => s.trim()).find((s) => s.length > 0);
+  return q || null;
+};
+
+const parseTranscriptAi = (raw: unknown): TranscriptAiInsights | undefined => {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const o = raw as Record<string, unknown>;
+  const summary = typeof o.summary === "string" ? o.summary.trim() : "";
+  const actionItems = Array.isArray(o.actionItems)
+    ? o.actionItems
+        .filter((item): item is string => typeof item === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const topics = Array.isArray(o.topics)
+    ? o.topics
+        .filter((item): item is string => typeof item === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const followUpQuestions = Array.isArray(o.followUpQuestions)
+    ? o.followUpQuestions
+        .filter((item): item is string => typeof item === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  if (!summary && actionItems.length === 0 && topics.length === 0 && followUpQuestions.length === 0) {
+    return undefined;
+  }
+  return {
+    summary,
+    actionItems,
+    topics,
+    ...(followUpQuestions.length > 0 ? { followUpQuestions } : {}),
+  };
+};
+
+const transcriptHasAiPayload = (item: TranscriptLogItem) => {
+  const ai = item.ai;
+  if (!ai) {
+    return false;
+  }
+  return (
+    !!ai.summary.trim() ||
+    (ai.actionItems?.length ?? 0) > 0 ||
+    (ai.topics?.length ?? 0) > 0 ||
+    (ai.followUpQuestions?.length ?? 0) > 0
+  );
+};
+
+const normalizeTopicKey = (raw: string) => raw.trim().toLowerCase().replace(/\s+/g, " ");
+
+const mergeTopicCounts = (
+  target: Map<string, { display: string; count: number }>,
+  topics: string[] | undefined,
+) => {
+  for (const t of topics ?? []) {
+    const key = normalizeTopicKey(t);
+    if (!key) {
+      continue;
+    }
+    const prev = target.get(key);
+    if (prev) {
+      prev.count += 1;
+    } else {
+      target.set(key, { display: t.trim(), count: 1 });
+    }
+  }
+};
+
+const buildAiInsightsOverview = (history: TranscriptLogItem[]): AiInsightsOverview => {
+  const sorted = [...history].sort((a, b) => b.createdAtMs - a.createdAtMs);
+  const withAi = sorted.filter(transcriptHasAiPayload);
+
+  const globalTopics = new Map<string, { display: string; count: number }>();
+  for (const item of withAi) {
+    mergeTopicCounts(globalTopics, item.ai?.topics);
+  }
+  const allTopics = [...globalTopics.values()].sort((a, b) => b.count - a.count);
+
+  const actionRows: AiInsightsOverview["actionItems"] = [];
+  const seenAction = new Set<string>();
+  for (const item of sorted) {
+    if (!transcriptHasAiPayload(item)) {
+      continue;
+    }
+    for (const line of item.ai?.actionItems ?? []) {
+      const key = line.trim().toLowerCase();
+      if (!key || seenAction.has(key)) {
+        continue;
+      }
+      seenAction.add(key);
+      actionRows.push({
+        text: line.trim(),
+        speaker: item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL,
+        createdAt: item.createdAt,
+      });
+      if (actionRows.length >= 48) {
+        break;
+      }
+    }
+    if (actionRows.length >= 48) {
+      break;
+    }
+  }
+
+  const voiceFollowUps: AiInsightsOverview["voiceFollowUps"] = [];
+  for (const item of sorted) {
+    if (!transcriptHasAiPayload(item)) {
+      continue;
+    }
+    const speaker = item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
+    for (const q of item.ai?.followUpQuestions ?? []) {
+      const question = q.trim();
+      if (!question) {
+        continue;
+      }
+      voiceFollowUps.push({
+        question,
+        speaker,
+        createdAt: item.createdAt,
+        historyId: item.id,
+      });
+      if (voiceFollowUps.length >= 24) {
+        break;
+      }
+    }
+    if (voiceFollowUps.length >= 24) {
+      break;
+    }
+  }
+
+  const bySpeakerMap = new Map<string, TranscriptLogItem[]>();
+  for (const item of withAi) {
+    const name = item.speakerName?.trim() || UNKNOWN_SPEAKER_LABEL;
+    const list = bySpeakerMap.get(name) ?? [];
+    list.push(item);
+    bySpeakerMap.set(name, list);
+  }
+
+  const bySpeaker: AiSpeakerRollup[] = [...bySpeakerMap.entries()]
+    .map(([speakerName, items]) => {
+      items.sort((a, b) => b.createdAtMs - a.createdAtMs);
+      const topics = new Map<string, { display: string; count: number }>();
+      const actions: string[] = [];
+      const seenLocal = new Set<string>();
+      for (const it of items) {
+        mergeTopicCounts(topics, it.ai?.topics);
+        for (const a of it.ai?.actionItems ?? []) {
+          const k = a.trim().toLowerCase();
+          if (k && !seenLocal.has(k)) {
+            seenLocal.add(k);
+            actions.push(a.trim());
+          }
+        }
+      }
+      const topicList = [...topics.values()].sort((a, b) => b.count - a.count);
+      const summaries = items
+        .filter((it) => it.ai?.summary?.trim())
+        .slice(0, 5)
+        .map((it) => ({ text: it.ai!.summary.trim(), createdAt: it.createdAt }));
+
+      return {
+        speakerName,
+        entryCount: items.length,
+        topics: topicList,
+        actionItems: actions.slice(0, 20),
+        summaries,
+      };
+    })
+    .sort((a, b) => b.entryCount - a.entryCount);
+
+  return {
+    totalEntries: history.length,
+    entriesWithAi: withAi.length,
+    allTopics,
+    actionItems: actionRows,
+    bySpeaker,
+    voiceFollowUps,
+  };
+};
+
 const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
   if (!value || typeof value !== "object") {
     return null;
@@ -646,6 +880,8 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
   const firstPassRecognitionEngine =
     fromPayload ??
     (fromDiag === "embedding" || fromDiag === "fingerprint" || fromDiag === "none" ? fromDiag : undefined);
+
+  const ai = parseTranscriptAi(item.ai);
 
   return {
     id,
@@ -668,10 +904,19 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
     wasVoiceMatchUsed: readBoolean(item, "wasVoiceMatchUsed"),
     wasConflictPromptShown: readBoolean(item, "wasConflictPromptShown"),
     wasVoiceProfileEnrolled: readBoolean(item, "wasVoiceProfileEnrolled"),
+    answeredVoiceFollowUp: readNullableString(item, "answeredVoiceFollowUp"),
     ...(firstPassRecognitionEngine ? { firstPassRecognitionEngine } : {}),
     transcriptionDiagnosticsInitial,
     transcriptionDiagnosticsEnrollment,
+    ...(ai ? { ai } : {}),
   };
+};
+
+const stripAiFromLogItem = (item: TranscriptLogItem): TranscriptLogItem => {
+  const next = { ...item };
+  delete next.ai;
+  delete next.answeredVoiceFollowUp;
+  return next;
 };
 
 const mergeHistoryEntries = (localEntries: TranscriptLogItem[], cloudEntries: TranscriptLogItem[]) => {
@@ -756,6 +1001,13 @@ export default function App() {
   const [enrollTargetName, setEnrollTargetName] = useState<string | null>(null);
   const [enrollSpeakerModalVisible, setEnrollSpeakerModalVisible] = useState(false);
   const [enrollNameDraft, setEnrollNameDraft] = useState("");
+  const [voiceFollowUp, setVoiceFollowUp] = useState<{ question: string } | null>(null);
+  const voiceFollowUpRef = useRef<{ question: string } | null>(null);
+  const updateVoiceFollowUp = useCallback((next: { question: string } | null) => {
+    voiceFollowUpRef.current = next;
+    setVoiceFollowUp(next);
+  }, []);
+  const historyRef = useRef(history);
 
   const closeUnknownSpeakerPrompt = (value: string) => {
     setUnknownSpeakerModalVisible(false);
@@ -777,11 +1029,29 @@ export default function App() {
     if (!apiUrl) {
       throw new Error("Missing EXPO_PUBLIC_TRANSCRIBE_API_URL.");
     }
-    return apiUrl.replace(/\/transcribe\/?$/, "");
+    return normalizeTranscribeApiBase(apiUrl);
   };
 
   const canShowTranscript = useMemo(() => transcript.length > 0, [transcript]);
+  const aiInsightsOverview = useMemo(() => buildAiInsightsOverview(history), [history]);
+
+  const speakActiveFollowUp = useCallback(() => {
+    if (!voiceFollowUp?.question) {
+      return;
+    }
+    Speech.stop();
+    Speech.speak(voiceFollowUp.question, {
+      language: "en-US",
+      rate: Platform.OS === "ios" ? 0.92 : 1,
+    });
+  }, [voiceFollowUp?.question]);
+
   const isRecording = recording !== null;
+
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
   const isBusy =
     isRecording || isUploading || unknownSpeakerModalVisible || enrollSpeakerModalVisible;
 
@@ -798,13 +1068,13 @@ export default function App() {
     options: { enrollmentSource?: SpeakerAttributionSource; historyClientId?: string } = {},
   ) => {
     const apiUrl = process.env.EXPO_PUBLIC_TRANSCRIBE_API_URL;
-    const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+    const apiToken = expoTranscribeBearerToken();
     if (!apiUrl) {
       throw new Error("Missing EXPO_PUBLIC_TRANSCRIBE_API_URL.");
     }
 
     const trimmedSpeakerName = currentSpeakerName.trim();
-    const baseUrl = apiUrl.replace(/\/transcribe\/?$/i, "");
+    const baseUrl = normalizeTranscribeApiBase(apiUrl);
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -880,7 +1150,9 @@ export default function App() {
       speakerEmbeddingEnabled?: boolean;
       speakerEmbeddingAvailable?: boolean;
       transcriptionDiagnostics?: unknown;
+      ai?: unknown;
     };
+    const ai = parseTranscriptAi(data.ai);
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",
       enrolledSpeakerName: data.enrolledSpeakerName?.trim() || null,
@@ -912,12 +1184,13 @@ export default function App() {
       speakerEmbeddingEnabled: data.speakerEmbeddingEnabled === true,
       speakerEmbeddingAvailable: data.speakerEmbeddingAvailable === true,
       transcriptionDiagnostics: parseTranscriptionDiagnostics(data.transcriptionDiagnostics),
+      ...(ai ? { ai } : {}),
     } satisfies TranscriptionResult;
   };
 
   const saveHistoryEntryToCloud = async (entry: TranscriptLogItem) => {
     try {
-      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const apiToken = expoTranscribeBearerToken();
       const response = await fetch(`${getApiBaseUrl()}/history`, {
         method: "POST",
         headers: {
@@ -944,7 +1217,7 @@ export default function App() {
 
   const fetchCloudHistory = async () => {
     try {
-      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const apiToken = expoTranscribeBearerToken();
       const response = await fetch(`${getApiBaseUrl()}/history?limit=100`, {
         headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
       });
@@ -962,10 +1235,71 @@ export default function App() {
     }
   };
 
+  const confirmClearAllAiHistory = () => {
+    Alert.alert(
+      "Clear all AI notes?",
+      "Removes AI summaries, tasks, topics, follow-ups, and voice follow-up tags from the server and this device. Transcripts and speaker data stay.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Clear",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              let serverErr: string | null = null;
+              try {
+                setErrorText(null);
+                const apiToken = expoTranscribeBearerToken();
+                const response = await fetch(`${getApiBaseUrl()}/history/clear-ai`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+                  },
+                  body: JSON.stringify({}),
+                });
+                if (!response.ok) {
+                  const raw = await response.text();
+                  let detail = raw || `HTTP ${response.status}`;
+                  try {
+                    const j = JSON.parse(raw) as { error?: string };
+                    if (typeof j.error === "string" && j.error.trim()) {
+                      detail = j.error.trim();
+                    }
+                  } catch {
+                    /* use raw text */
+                  }
+                  serverErr =
+                    response.status === 401
+                      ? `${detail} (check EXPO_PUBLIC_TRANSCRIBE_API_TOKEN matches SERVER_BEARER_TOKEN)`
+                      : response.status === 404
+                        ? `${detail} (redeploy API so POST /history/clear-ai exists)`
+                        : detail;
+                }
+              } catch (err) {
+                serverErr = err instanceof Error ? err.message : "Network error";
+              }
+              Speech.stop();
+              updateVoiceFollowUp(null);
+              setHistory((h) => h.map(stripAiFromLogItem));
+              if (serverErr) {
+                setErrorText(serverErr);
+                Alert.alert(
+                  "Server did not clear AI data",
+                  `Your device log no longer shows AI notes. Server: ${serverErr}`,
+                );
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
   const fetchSpeakers = async (suppressError = false) => {
     try {
       setIsLoadingSpeakers(true);
-      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const apiToken = expoTranscribeBearerToken();
       const response = await fetch(`${getApiBaseUrl()}/speakers`, {
         headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
       });
@@ -992,7 +1326,7 @@ export default function App() {
   };
 
   const persistSpeakerHintToApi = async (name: string, speakerDescription: string) => {
-    const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+    const apiToken = expoTranscribeBearerToken();
     const response = await fetch(`${getApiBaseUrl()}/speakers`, {
       method: "PATCH",
       headers: {
@@ -1050,7 +1384,7 @@ export default function App() {
 
   const clearSpeakerProfiles = async () => {
     try {
-      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const apiToken = expoTranscribeBearerToken();
       const response = await fetch(`${getApiBaseUrl()}/speakers`, {
         method: "DELETE",
         headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
@@ -1071,7 +1405,7 @@ export default function App() {
     recentHistory: TranscriptLogItem[],
   ) => {
     try {
-      const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+      const apiToken = expoTranscribeBearerToken();
       const response = await fetch(`${getApiBaseUrl()}/ai/speaker-correction`, {
         method: "POST",
         headers: {
@@ -1192,7 +1526,7 @@ export default function App() {
             void (async () => {
               try {
                 setErrorText(null);
-                const apiToken = process.env.EXPO_PUBLIC_TRANSCRIBE_API_TOKEN;
+                const apiToken = expoTranscribeBearerToken();
                 const response = await fetch(
                   `${getApiBaseUrl()}/speakers/${encodeURIComponent(speakerName)}/samples/${encodeURIComponent(sampleId)}`,
                   {
@@ -1279,6 +1613,8 @@ export default function App() {
           throw new Error("No recording file found.");
         }
 
+        const answeredVoiceFollowUpTo = voiceFollowUpRef.current?.question?.trim() || null;
+
         const enrollName = enrollTargetNameRef.current;
         enrollTargetNameRef.current = null;
         setEnrollTargetName(null);
@@ -1359,6 +1695,8 @@ export default function App() {
             wasVoiceMatchUsed,
             wasConflictPromptShown,
             wasVoiceProfileEnrolled: !voiceEnrollmentRequestFailed,
+            ...(answeredVoiceFollowUpTo ? { answeredVoiceFollowUp: answeredVoiceFollowUpTo } : {}),
+            ...(result.ai ? { ai: result.ai } : {}),
             ...(transcriptionDiagnosticsEnrollment
               ? { transcriptionDiagnosticsEnrollment }
               : {}),
@@ -1366,6 +1704,11 @@ export default function App() {
           setHistory((current) => [{ ...newHistoryEntry }, ...current]);
           void saveHistoryEntryToCloud(newHistoryEntry);
           void fetchSpeakers(true);
+          updateVoiceFollowUp(null);
+          const nextFq = pickFirstFollowUpQuestion(result.ai);
+          if (nextFq) {
+            updateVoiceFollowUp({ question: nextFq });
+          }
           if (!voiceEnrollmentRequestFailed) {
             setStatusText(
               text
@@ -1391,6 +1734,7 @@ export default function App() {
         }
         let transcriptionDiagnosticsEnrollment: TranscriptionDiagnosticsPhase | undefined;
         const text = result.text;
+        let historyAiInsight = result.ai;
         const manualSpeakerName = "";
         const typedSpeakerName = "";
         let shouldRefreshSpeakers = !!manualSpeakerName;
@@ -1460,6 +1804,7 @@ export default function App() {
               shouldRefreshSpeakers = true;
               enrolledVoiceAsName = enrollmentResult.enrolledSpeakerName || trimmedEntered;
               normalizedSpeakerName = enrolledVoiceAsName;
+              historyAiInsight = enrollmentResult.ai ?? historyAiInsight;
             } catch (enrollError) {
               voiceEnrollmentRequestFailed = true;
               const enrollMessage =
@@ -1500,6 +1845,8 @@ export default function App() {
           ...(pass1RecognitionEngine ? { firstPassRecognitionEngine: pass1RecognitionEngine } : {}),
           ...(transcriptionDiagnosticsInitial ? { transcriptionDiagnosticsInitial } : {}),
           ...(transcriptionDiagnosticsEnrollment ? { transcriptionDiagnosticsEnrollment } : {}),
+          ...(historyAiInsight ? { ai: historyAiInsight } : {}),
+          ...(answeredVoiceFollowUpTo ? { answeredVoiceFollowUp: answeredVoiceFollowUpTo } : {}),
         };
         setHistory((current) => [
           {
@@ -1510,6 +1857,11 @@ export default function App() {
         void saveHistoryEntryToCloud(newHistoryEntry);
         if (shouldRefreshSpeakers) {
           void fetchSpeakers(true);
+        }
+        updateVoiceFollowUp(null);
+        const nextFq = pickFirstFollowUpQuestion(historyAiInsight);
+        if (nextFq) {
+          updateVoiceFollowUp({ question: nextFq });
         }
         if (!voiceEnrollmentRequestFailed) {
           if (enrolledVoiceAsName) {
@@ -1846,7 +2198,7 @@ export default function App() {
               <Ionicons
                 name="mic"
                 size={16}
-                color={activeTab === "record" ? "#ffffff" : "#64748b"}
+                color={activeTab === "record" ? "#ffffff" : "#475569"}
               />
               <Text style={[styles.tabButtonText, activeTab === "record" && styles.tabButtonTextActive]}>
                 Record
@@ -1861,7 +2213,7 @@ export default function App() {
               <Ionicons
                 name="time-outline"
                 size={17}
-                color={activeTab === "history" ? "#ffffff" : "#64748b"}
+                color={activeTab === "history" ? "#ffffff" : "#475569"}
               />
               <Text style={[styles.tabButtonText, activeTab === "history" && styles.tabButtonTextActive]}>
                 History
@@ -1876,11 +2228,24 @@ export default function App() {
               <Ionicons
                 name="people-outline"
                 size={17}
-                color={activeTab === "speakers" ? "#ffffff" : "#64748b"}
+                color={activeTab === "speakers" ? "#ffffff" : "#475569"}
               />
               <Text style={[styles.tabButtonText, activeTab === "speakers" && styles.tabButtonTextActive]}>
                 Speakers
               </Text>
+            </View>
+          </Pressable>
+          <Pressable
+            style={[styles.tabButton, activeTab === "ai" && styles.tabButtonActive]}
+            onPress={() => setActiveTab("ai")}
+          >
+            <View style={styles.tabButtonInner}>
+              <Ionicons
+                name="sparkles-outline"
+                size={17}
+                color={activeTab === "ai" ? "#ffffff" : "#475569"}
+              />
+              <Text style={[styles.tabButtonText, activeTab === "ai" && styles.tabButtonTextActive]}>AI</Text>
             </View>
           </Pressable>
         </View>
@@ -1892,6 +2257,35 @@ export default function App() {
             <Text style={styles.tabIntro}>
               Tap the mic to transcribe with auto speaker ID — or the badge to add a new voice on purpose.
             </Text>
+
+            {voiceFollowUp && !enrollTargetName ? (
+              <View style={styles.voiceFollowUpBanner}>
+                <Text style={styles.voiceFollowUpLabel}>AI follow-up (speak your answer with the mic below)</Text>
+                <Text style={styles.voiceFollowUpQuestion}>{voiceFollowUp.question}</Text>
+                <View style={styles.voiceFollowUpActions}>
+                  <Pressable
+                    style={styles.voiceFollowUpButtonSecondary}
+                    onPress={speakActiveFollowUp}
+                    accessibilityRole="button"
+                    accessibilityLabel="Play question aloud"
+                  >
+                    <Ionicons name="volume-high-outline" size={18} color="#0f766e" />
+                    <Text style={styles.voiceFollowUpButtonSecondaryText}>Play question</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.voiceFollowUpButtonGhost}
+                    onPress={() => {
+                      Speech.stop();
+                      updateVoiceFollowUp(null);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Dismiss follow-up"
+                  >
+                    <Text style={styles.voiceFollowUpButtonGhostText}>Dismiss</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
 
             {enrollTargetName ? (
               <View style={styles.enrollChip}>
@@ -2066,6 +2460,88 @@ export default function App() {
                                             {item.matchedEnrollmentSampleId ||
                                               (item.wasSpeakerNameInputProvided ? "User input" : "None")}
                                           </Text>
+                                          {item.ai &&
+                                          (item.ai.summary ||
+                                            (item.ai.actionItems?.length ?? 0) > 0 ||
+                                            (item.ai.topics?.length ?? 0) > 0 ||
+                                            (item.ai.followUpQuestions?.length ?? 0) > 0) ? (
+                                            <View style={styles.historyAiBlock}>
+                                              <Text style={styles.historySectionLabel}>AI summary</Text>
+                                              {item.ai.summary ? (
+                                                <Text style={styles.historyAiSummary}>{item.ai.summary}</Text>
+                                              ) : null}
+                                              {(item.ai.actionItems?.length ?? 0) > 0 ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Action items
+                                                  </Text>
+                                                  {item.ai.actionItems.map((line, idx) => (
+                                                    <Text key={`ai-act-${item.id}-${idx}`} style={styles.historyAiBullet}>
+                                                      • {line}
+                                                    </Text>
+                                                  ))}
+                                                </>
+                                              ) : null}
+                                              {(item.ai.topics?.length ?? 0) > 0 ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Topics
+                                                  </Text>
+                                                  <Text style={styles.historyAiTopicsLine}>
+                                                    {item.ai.topics.join(" · ")}
+                                                  </Text>
+                                                </>
+                                              ) : null}
+                                              {(item.ai.followUpQuestions?.length ?? 0) > 0 ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Follow-up questions
+                                                  </Text>
+                                                  {(item.ai.followUpQuestions ?? []).map((q, idx) => (
+                                                    <View key={`ai-fq-${item.id}-${idx}`} style={styles.historyFollowUpItem}>
+                                                      <Text style={styles.historyFollowUpItemText}>{q}</Text>
+                                                      <View style={styles.historyFollowUpItemActions}>
+                                                        <Pressable
+                                                          style={styles.historyFollowUpTinyButton}
+                                                          onPress={() => {
+                                                            Speech.stop();
+                                                            Speech.speak(q, {
+                                                              language: "en-US",
+                                                              rate: Platform.OS === "ios" ? 0.92 : 1,
+                                                            });
+                                                          }}
+                                                          accessibilityRole="button"
+                                                          accessibilityLabel="Play question"
+                                                        >
+                                                          <Ionicons name="volume-high-outline" size={14} color="#0f766e" />
+                                                        </Pressable>
+                                                        <Pressable
+                                                          style={styles.historyFollowUpAnswerLink}
+                                                          onPress={() => {
+                                                            Speech.stop();
+                                                            updateVoiceFollowUp({ question: q });
+                                                            setActiveTab("record");
+                                                          }}
+                                                          accessibilityRole="button"
+                                                          accessibilityLabel="Answer with voice"
+                                                        >
+                                                          <Text style={styles.historyFollowUpAnswerLinkText}>Answer</Text>
+                                                        </Pressable>
+                                                      </View>
+                                                    </View>
+                                                  ))}
+                                                </>
+                                              ) : null}
+                                            </View>
+                                          ) : null}
+                                          {item.answeredVoiceFollowUp ? (
+                                            <View style={styles.historyAnsweredFollowUp}>
+                                              <Text style={styles.historySectionLabel}>Answered AI question</Text>
+                                              <Text style={styles.historyAnsweredFollowUpText} selectable>
+                                                {item.answeredVoiceFollowUp}
+                                              </Text>
+                                            </View>
+                                          ) : null}
                                           <Text style={styles.historySectionLabel}>Voice match</Text>
                                           <Text style={styles.historyVoiceMatchDetail} selectable>
                                             {formatHistoryVoiceMatchDetail(item)}
@@ -2281,6 +2757,177 @@ export default function App() {
             </View>
           </ScrollView>
         ) : null}
+
+        {activeTab === "ai" ? (
+          <ScrollView
+            style={styles.aiTabScroll}
+            contentContainerStyle={styles.aiTabContent}
+            keyboardShouldPersistTaps="handled"
+          >
+            <Text style={styles.tabIntro}>
+              Summaries, tasks, and topics from clips that already have AI data from transcription or history save
+              (needs API with OpenAI at capture time).
+            </Text>
+            <View style={styles.aiOverviewPanel}>
+              <Text style={styles.panelTitle}>Overview</Text>
+              <Text style={styles.aiOverviewLine}>
+                {aiInsightsOverview.entriesWithAi} of {aiInsightsOverview.totalEntries} log entries include AI notes.
+              </Text>
+              {history.length > 0 ? (
+                <Pressable
+                  style={styles.aiClearAiButton}
+                  onPress={confirmClearAllAiHistory}
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear all AI notes from log"
+                >
+                  <Text style={styles.aiClearAiButtonText}>Clear all AI notes…</Text>
+                </Pressable>
+              ) : null}
+              {aiInsightsOverview.totalEntries === 0 ? (
+                <Text style={[styles.historyEmptyText, styles.aiPanelInset]}>
+                  Record something first — insights appear after history is saved.
+                </Text>
+              ) : aiInsightsOverview.entriesWithAi === 0 ? (
+                <View style={styles.aiPanelInset}>
+                  <Text style={styles.historyEmptyText}>
+                    Nothing to show yet. This usually means either you have no saved clips, or no clip stored an AI block.
+                  </Text>
+                  <Text style={styles.aiHelpBullet}>
+                    • The server needs OPENAI_API_KEY so new recordings can store an AI block with the transcript.
+                  </Text>
+                  <Text style={styles.aiHelpBullet}>• In History, expand an entry — you should see an “AI summary” block when present.</Text>
+                </View>
+              ) : null}
+            </View>
+
+            {aiInsightsOverview.allTopics.length > 0 ? (
+              <View style={styles.aiSectionPanel}>
+                <Text style={styles.aiSectionHeading}>Topics across everyone</Text>
+                <Text style={styles.aiSectionSub}>
+                  How often each theme appeared (from AI tags on your clips).
+                </Text>
+                <View style={styles.aiChipWrap}>
+                  {aiInsightsOverview.allTopics.map((t, i) => (
+                    <View key={`all-topic-${i}-${t.display}`} style={styles.aiChip}>
+                      <Text style={styles.aiChipText}>
+                        {t.display}
+                        <Text style={styles.aiChipCount}> ({t.count})</Text>
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            ) : null}
+
+            {aiInsightsOverview.actionItems.length > 0 ? (
+              <View style={styles.aiSectionPanel}>
+                <Text style={styles.aiSectionHeading}>Action items</Text>
+                <Text style={styles.aiSectionSub}>Recent tasks deduplicated — who and when.</Text>
+                {aiInsightsOverview.actionItems.map((row, idx) => (
+                  <View key={`${row.text}-${idx}`} style={styles.aiActionRow}>
+                    <Text style={styles.aiActionBullet}>• {row.text}</Text>
+                    <Text style={styles.aiActionMeta}>
+                      {row.speaker} · {row.createdAt}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+
+            {aiInsightsOverview.voiceFollowUps.length > 0 ? (
+              <View style={styles.aiSectionPanel}>
+                <Text style={styles.aiSectionHeading}>Voice follow-ups</Text>
+                <Text style={styles.aiSectionSub}>
+                  Questions the model wants you to answer — use Record to speak back; we tag that clip with the question.
+                </Text>
+                {aiInsightsOverview.voiceFollowUps.map((row, idx) => (
+                  <View key={`vf-${row.historyId}-${idx}`} style={styles.voiceFollowUpRow}>
+                    <Text style={styles.voiceFollowUpRowQuestion}>{row.question}</Text>
+                    <Text style={styles.voiceFollowUpRowMeta}>
+                      {row.speaker} · {row.createdAt}
+                    </Text>
+                    <View style={styles.voiceFollowUpRowActions}>
+                      <Pressable
+                        style={styles.voiceFollowUpRowButton}
+                        onPress={() => {
+                          Speech.stop();
+                          Speech.speak(row.question, {
+                            language: "en-US",
+                            rate: Platform.OS === "ios" ? 0.92 : 1,
+                          });
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel="Hear question"
+                      >
+                        <Ionicons name="volume-high-outline" size={16} color="#0f766e" />
+                        <Text style={styles.voiceFollowUpRowButtonText}>Hear</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.voiceFollowUpRowButtonPrimary}
+                        onPress={() => {
+                          Speech.stop();
+                          updateVoiceFollowUp({ question: row.question });
+                          setActiveTab("record");
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel="Answer by voice"
+                      >
+                        <Text style={styles.voiceFollowUpRowButtonPrimaryText}>Answer</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+
+            {aiInsightsOverview.bySpeaker.length > 0 ? (
+              <View style={styles.aiSectionPanel}>
+                <Text style={styles.aiSectionHeading}>By speaker</Text>
+                <Text style={styles.aiSectionSub}>Per-person topics, tasks, and latest summaries.</Text>
+                {aiInsightsOverview.bySpeaker.map((rollup) => (
+                  <View key={rollup.speakerName} style={styles.aiSpeakerCard}>
+                    <View style={styles.aiSpeakerCardHeader}>
+                      <Text style={styles.aiSpeakerCardTitle}>{rollup.speakerName}</Text>
+                      <Text style={styles.aiSpeakerCardCount}>{rollup.entryCount} with AI</Text>
+                    </View>
+                    {rollup.topics.length > 0 ? (
+                      <View style={styles.aiChipWrap}>
+                        {rollup.topics.map((t, i) => (
+                          <View key={`${rollup.speakerName}-topic-${i}`} style={styles.aiChipMuted}>
+                            <Text style={styles.aiChipTextMuted}>
+                              {t.display} <Text style={styles.aiChipCountMuted}>({t.count})</Text>
+                            </Text>
+                          </View>
+                        ))}
+                      </View>
+                    ) : null}
+                    {rollup.actionItems.length > 0 ? (
+                      <>
+                        <Text style={styles.aiMiniHeading}>Their action items</Text>
+                        {rollup.actionItems.map((line, idx) => (
+                          <Text key={`${rollup.speakerName}-act-${idx}`} style={styles.aiBulletMuted}>
+                            • {line}
+                          </Text>
+                        ))}
+                      </>
+                    ) : null}
+                    {rollup.summaries.length > 0 ? (
+                      <>
+                        <Text style={styles.aiMiniHeading}>Recent summaries</Text>
+                        {rollup.summaries.map((s, idx) => (
+                          <View key={`${rollup.speakerName}-sum-${idx}`} style={styles.aiSummaryBlock}>
+                            <Text style={styles.aiSummaryMeta}>{s.createdAt}</Text>
+                            <Text style={styles.aiSummaryBody}>{s.text}</Text>
+                          </View>
+                        ))}
+                      </>
+                    ) : null}
+                  </View>
+                ))}
+              </View>
+            ) : null}
+          </ScrollView>
+        ) : null}
       </View>
     </SafeAreaView>
     </View>
@@ -2394,7 +3041,7 @@ const styles = StyleSheet.create({
   },
   tabButtonText: {
     color: "#475569",
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "700",
   },
   tabButtonTextActive: {
@@ -2409,6 +3056,202 @@ const styles = StyleSheet.create({
   },
   speakerTabContent: {
     paddingBottom: 18,
+  },
+  aiTabScroll: {
+    marginTop: 2,
+    minHeight: 300,
+    maxHeight: 560,
+  },
+  aiTabContent: {
+    paddingBottom: 24,
+    flexGrow: 1,
+  },
+  aiOverviewPanel: {
+    marginTop: 4,
+    borderRadius: 18,
+    backgroundColor: "#eef6f4",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.28)",
+    paddingBottom: 14,
+  },
+  aiOverviewLine: {
+    color: "#334155",
+    fontSize: 13,
+    lineHeight: 20,
+    marginHorizontal: 14,
+    marginTop: 4,
+    fontWeight: "600",
+  },
+  aiClearAiButton: {
+    alignSelf: "flex-start",
+    marginHorizontal: 14,
+    marginTop: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "rgba(220, 38, 38, 0.45)",
+    backgroundColor: "rgba(254, 242, 242, 0.9)",
+  },
+  aiClearAiButtonText: {
+    color: "#b91c1c",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  aiSectionPanel: {
+    marginTop: 14,
+    borderRadius: 18,
+    backgroundColor: "#eef6f4",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.28)",
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+  },
+  aiPanelInset: {
+    marginHorizontal: 14,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  aiHelpBullet: {
+    color: "#475569",
+    fontSize: 13,
+    lineHeight: 20,
+    marginTop: 8,
+    fontWeight: "500",
+  },
+  aiSectionHeading: {
+    color: "#0f172a",
+    fontSize: 15,
+    fontWeight: "800",
+    marginBottom: 4,
+  },
+  aiSectionSub: {
+    color: "#64748b",
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 12,
+  },
+  aiChipWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  aiChip: {
+    borderRadius: 999,
+    backgroundColor: "rgba(20, 184, 166, 0.2)",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  aiChipText: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  aiChipCount: {
+    color: "#115e59",
+    fontWeight: "600",
+  },
+  aiChipMuted: {
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 255, 255, 0.9)",
+    borderWidth: 1,
+    borderColor: "rgba(148, 163, 184, 0.5)",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  aiChipTextMuted: {
+    color: "#334155",
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  aiChipCountMuted: {
+    color: "#64748b",
+    fontWeight: "600",
+  },
+  aiActionRow: {
+    marginBottom: 10,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(15, 118, 110, 0.12)",
+  },
+  aiActionBullet: {
+    color: "#0f172a",
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: "600",
+  },
+  aiActionMeta: {
+    color: "#64748b",
+    fontSize: 11,
+    marginTop: 4,
+    fontWeight: "500",
+  },
+  aiSpeakerCard: {
+    marginTop: 12,
+    padding: 14,
+    borderRadius: 14,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.22)",
+    shadowColor: "#0f172a",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  aiSpeakerCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10,
+    gap: 8,
+  },
+  aiSpeakerCardTitle: {
+    color: "#0f172a",
+    fontSize: 16,
+    fontWeight: "800",
+    flex: 1,
+  },
+  aiSpeakerCardCount: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  aiMiniHeading: {
+    color: "#047857",
+    fontSize: 11,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  aiBulletMuted: {
+    color: "#475569",
+    fontSize: 13,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  aiSummaryBlock: {
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  aiSummaryMeta: {
+    color: "#64748b",
+    fontSize: 11,
+    fontWeight: "600",
+    marginBottom: 6,
+  },
+  aiSummaryBody: {
+    color: "#1e293b",
+    fontSize: 13,
+    lineHeight: 20,
   },
   tabIntro: {
     color: "#334155",
@@ -2520,6 +3363,161 @@ const styles = StyleSheet.create({
     color: "#115e59",
     fontSize: 12,
     fontWeight: "700",
+  },
+  voiceFollowUpBanner: {
+    marginBottom: 14,
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: "#ecfdf5",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+  },
+  voiceFollowUpLabel: {
+    color: "#047857",
+    fontSize: 11,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    marginBottom: 6,
+  },
+  voiceFollowUpQuestion: {
+    color: "#0f172a",
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: "700",
+    marginBottom: 12,
+  },
+  voiceFollowUpActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "center",
+  },
+  voiceFollowUpButtonSecondary: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "rgba(255, 255, 255, 0.95)",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.35)",
+  },
+  voiceFollowUpButtonSecondaryText: {
+    color: "#0f766e",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  voiceFollowUpButtonGhost: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  voiceFollowUpButtonGhostText: {
+    color: "#64748b",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  voiceFollowUpRow: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(15, 118, 110, 0.12)",
+  },
+  voiceFollowUpRowQuestion: {
+    color: "#0f172a",
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: "600",
+  },
+  voiceFollowUpRowMeta: {
+    color: "#64748b",
+    fontSize: 11,
+    marginTop: 4,
+    fontWeight: "500",
+  },
+  voiceFollowUpRowActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 10,
+    alignItems: "center",
+  },
+  voiceFollowUpRowButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.95)",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.28)",
+  },
+  voiceFollowUpRowButtonText: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  voiceFollowUpRowButtonPrimary: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: "#14b8a6",
+    borderWidth: 1,
+    borderColor: "rgba(204, 251, 241, 0.9)",
+  },
+  voiceFollowUpRowButtonPrimaryText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  historyFollowUpItem: {
+    marginBottom: 10,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(100, 116, 139, 0.2)",
+  },
+  historyFollowUpItemText: {
+    color: "#334155",
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 6,
+  },
+  historyFollowUpItemActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  historyFollowUpTinyButton: {
+    padding: 6,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "rgba(15, 118, 110, 0.25)",
+  },
+  historyFollowUpAnswerLink: {
+    paddingVertical: 4,
+  },
+  historyFollowUpAnswerLinkText: {
+    color: "#0d9488",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  historyAnsweredFollowUp: {
+    marginTop: 8,
+    marginBottom: 4,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: "#f0fdfa",
+    borderWidth: 1,
+    borderColor: "rgba(20, 184, 166, 0.35)",
+  },
+  historyAnsweredFollowUpText: {
+    color: "#134e4a",
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "600",
   },
   historyToggleButton: {
     marginTop: 2,
@@ -2731,6 +3729,37 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     marginTop: 6,
     marginBottom: 4,
+  },
+  historyAiBlock: {
+    marginTop: 8,
+    marginBottom: 6,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "rgba(100, 116, 139, 0.25)",
+  },
+  historyAiSummary: {
+    color: "#0f172a",
+    fontSize: 14,
+    lineHeight: 21,
+    marginBottom: 6,
+  },
+  historyAiSubLabel: {
+    marginTop: 10,
+  },
+  historyAiBullet: {
+    color: "#334155",
+    fontSize: 13,
+    lineHeight: 20,
+    marginLeft: 4,
+    marginBottom: 2,
+  },
+  historyAiTopicsLine: {
+    color: "#475569",
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: "600",
   },
   historyVoiceMatchDetail: {
     color: "#0f172a",
