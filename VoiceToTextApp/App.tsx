@@ -945,6 +945,52 @@ const buildRecentLogsForDestinationExtract = (history: TranscriptLogItem[]) => {
     .join("\n\n---\n\n");
 };
 
+/** ~60 days of logs for POST /ai/week-tasks (upcoming week planning). */
+const MS_DAY = 24 * 60 * 60 * 1000;
+
+const getUpcomingWeekWindowLabel = () => {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start.getTime() + 6 * MS_DAY);
+  end.setHours(23, 59, 59, 999);
+  const opts: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric", year: "numeric" };
+  return `${start.toLocaleDateString(undefined, opts)} through ${end.toLocaleDateString(undefined, opts)} (local, 7 days inclusive)`;
+};
+
+const buildWeekTasksBundle = (history: TranscriptLogItem[]): string | null => {
+  if (history.length === 0) {
+    return null;
+  }
+  const sorted = [...history].sort((a, b) => b.createdAtMs - a.createdAtMs);
+  const cutoff = Date.now() - 60 * MS_DAY;
+  const rows = sorted.filter((h) => h.createdAtMs >= cutoff).slice(0, 80);
+  if (rows.length === 0) {
+    return null;
+  }
+  const blocks = rows.map((h) => {
+    const dateStr = new Date(h.createdAtMs).toLocaleString();
+    const lines: string[] = [`Speaker: ${h.speakerName} | Log time: ${h.createdAt} | ${dateStr}`];
+    if (h.text?.trim()) {
+      const t = h.text.trim();
+      lines.push(`Transcript: ${t.slice(0, 1500)}${t.length > 1500 ? "…" : ""}`);
+    }
+    const acts = h.ai?.actionItems?.filter((x) => x.trim()) ?? [];
+    if (acts.length) {
+      lines.push(`AI action items: ${acts.join(" | ")}`);
+    }
+    if (h.ai?.summary?.trim()) {
+      const s = h.ai.summary.trim();
+      lines.push(`AI summary: ${s.slice(0, 500)}${s.length > 500 ? "…" : ""}`);
+    }
+    const topics = h.ai?.topics?.filter((x) => x.trim()) ?? [];
+    if (topics.length) {
+      lines.push(`Topics: ${topics.join(", ")}`);
+    }
+    return lines.join("\n");
+  });
+  return blocks.join("\n\n—\n\n");
+};
+
 /** Concatenate saved clips for one speaker for POST /ai/person-summary. */
 const buildPersonSummaryBundle = (speakerName: string, history: TranscriptLogItem[]): string | null => {
   const key = normalizeSpeakerKey(speakerName);
@@ -1138,6 +1184,8 @@ export default function App() {
     null,
   );
   const [todayPlanModal, setTodayPlanModal] = useState<{ speakerName: string; narrative: string } | null>(null);
+  const [weekTasksReportModal, setWeekTasksReportModal] = useState<string | null>(null);
+  const [weekTasksLoading, setWeekTasksLoading] = useState(false);
   const [speakerAiLoading, setSpeakerAiLoading] = useState<{ kind: "summary" | "today"; key: string } | null>(null);
   const [trafficDestinationDraft, setTrafficDestinationDraft] = useState("");
   const [trafficWatchActive, setTrafficWatchActive] = useState(false);
@@ -1688,6 +1736,53 @@ export default function App() {
       }
     };
   }, [trafficWatchActive, trafficDestinationDraft, runOneTrafficCheck]);
+
+  const loadWeekTasksReport = useCallback(async () => {
+    const bundle = buildWeekTasksBundle(history);
+    if (!bundle?.trim()) {
+      Alert.alert("No logs", "Save some voice clips first.");
+      return;
+    }
+    const windowLabel = getUpcomingWeekWindowLabel();
+    setWeekTasksLoading(true);
+    setErrorText(null);
+    try {
+      const apiToken = expoTranscribeBearerToken();
+      const response = await fetch(`${getApiBaseUrl()}/ai/week-tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+        },
+        body: JSON.stringify({ windowLabel, text: bundle }),
+      });
+      const raw = await response.text();
+      if (!response.ok) {
+        let detail = raw || `HTTP ${response.status}`;
+        try {
+          const j = JSON.parse(raw) as { error?: string };
+          if (typeof j.error === "string" && j.error.trim()) {
+            detail = j.error.trim();
+          }
+        } catch {
+          /* */
+        }
+        throw new Error(detail);
+      }
+      const data = JSON.parse(raw) as { report?: string };
+      const report = typeof data.report === "string" ? data.report.trim() : "";
+      if (!report) {
+        throw new Error("Empty report from server.");
+      }
+      setWeekTasksReportModal(report);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not build week tasks.";
+      setErrorText(msg);
+      Alert.alert("Week tasks", msg);
+    } finally {
+      setWeekTasksLoading(false);
+    }
+  }, [history]);
 
   const fetchSpeakers = async (suppressError = false) => {
     try {
@@ -2673,6 +2768,33 @@ export default function App() {
           </View>
         </View>
       </Modal>
+      <Modal
+        visible={weekTasksReportModal !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setWeekTasksReportModal(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={() => setWeekTasksReportModal(null)} />
+          <View style={[styles.modalCard, styles.personSummaryModalCard]}>
+            <Text style={styles.modalTitle}>Next week · by person</Text>
+            <Text style={styles.modalSubtitle}>{getUpcomingWeekWindowLabel()}</Text>
+            <ScrollView style={styles.personSummaryScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+              <Text style={styles.personSummaryBody} selectable>
+                {weekTasksReportModal ?? ""}
+              </Text>
+            </ScrollView>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonPrimary]}
+                onPress={() => setWeekTasksReportModal(null)}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <View style={styles.card}>
         <View style={styles.cardHeaderRow}>
           <View style={styles.cardHeaderMain}>
@@ -3318,14 +3440,29 @@ export default function App() {
                 {aiInsightsOverview.entriesWithAi} of {aiInsightsOverview.totalEntries} log entries include AI notes.
               </Text>
               {history.length > 0 ? (
-                <Pressable
-                  style={styles.aiClearAiButton}
-                  onPress={confirmClearAllAiHistory}
-                  accessibilityRole="button"
-                  accessibilityLabel="Clear all AI notes from log"
-                >
-                  <Text style={styles.aiClearAiButtonText}>Clear all AI notes…</Text>
-                </Pressable>
+                <View style={styles.aiOverviewButtonCol}>
+                  <Pressable
+                    style={[styles.aiClearAiButton, styles.aiOverviewPanelTightButton]}
+                    onPress={confirmClearAllAiHistory}
+                    accessibilityRole="button"
+                    accessibilityLabel="Clear all AI notes from log"
+                  >
+                    <Text style={styles.aiClearAiButtonText}>Clear all AI notes…</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.aiWeekTasksButton, weekTasksLoading && styles.controlDisabled]}
+                    disabled={weekTasksLoading}
+                    onPress={() => void loadWeekTasksReport()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Show next seven days tasks by person"
+                  >
+                    {weekTasksLoading ? (
+                      <ActivityIndicator color="#0f766e" />
+                    ) : (
+                      <Text style={styles.aiWeekTasksButtonText}>Next 7 days · tasks by person</Text>
+                    )}
+                  </Pressable>
+                </View>
               ) : null}
               {aiInsightsOverview.totalEntries === 0 ? (
                 <Text style={[styles.historyEmptyText, styles.aiPanelInset]}>
@@ -3735,6 +3872,32 @@ const styles = StyleSheet.create({
     color: "#b91c1c",
     fontSize: 12,
     fontWeight: "800",
+  },
+  aiOverviewButtonCol: {
+    marginTop: 10,
+    marginHorizontal: 14,
+    gap: 10,
+  },
+  aiOverviewPanelTightButton: {
+    marginHorizontal: 0,
+    marginTop: 0,
+    alignSelf: "stretch",
+  },
+  aiWeekTasksButton: {
+    alignSelf: "stretch",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "rgba(13, 148, 136, 0.55)",
+    backgroundColor: "rgba(236, 253, 245, 0.95)",
+    alignItems: "center",
+  },
+  aiWeekTasksButtonText: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: "800",
+    textAlign: "center",
   },
   aiSectionPanel: {
     marginTop: 14,

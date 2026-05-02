@@ -9,6 +9,10 @@
  */
 const { onInit } = require("firebase-functions/v2/core");
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
+
+/** Must match process.env name used in app.js for Directions / traffic. Bind with deploy + Secret Manager. */
+const googleMapsApiKey = defineSecret("GOOGLE_MAPS_API_KEY");
 
 let expressApp;
 
@@ -27,6 +31,7 @@ exports.api = onRequest(
     concurrency: 2,
     minInstances: 1,
     invoker: "public",
+    secrets: [googleMapsApiKey],
   },
   (req, res) => expressApp(req, res),
 );

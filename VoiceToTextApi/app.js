@@ -18,7 +18,16 @@ const serverToken =
 const openaiApiKey = process.env.OPENAI_API_KEY;
 const assemblyApiKey = process.env.ASSEMBLYAI_API_KEY;
 const openaiAiModel = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
-const googleMapsApiKey = (process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_DIRECTIONS_API_KEY || "").trim();
+const normalizeGoogleMapsApiKey = (raw) => {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  let s = raw.replace(/^\uFEFF/, "").trim();
+  s = s.replace(/\s/g, "");
+  return s;
+};
+const getGoogleMapsApiKey = () =>
+  normalizeGoogleMapsApiKey(process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_DIRECTIONS_API_KEY || "");
 const assemblySpeechModels = ["universal-3-pro", "universal-2"];
 const forcedLanguageCode = process.env.ASSEMBLYAI_FORCE_LANGUAGE_CODE || "";
 const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,te,bn")
@@ -371,7 +380,59 @@ const buildExtractDestination = async (contextText) => {
   return typeof parsed.destination === "string" ? parsed.destination.trim().slice(0, 500) : "";
 };
 
+const buildWeekTasksReport = async (windowLabel, contextText) => {
+  if (!openaiApiKey || !contextText.trim()) {
+    return "";
+  }
+  const client = getOpenAIClient();
+  if (!client) {
+    return "";
+  }
+  const win =
+    typeof windowLabel === "string" && windowLabel.trim()
+      ? windowLabel.trim().slice(0, 280)
+      : "the next 7 calendar days from today (user local time)";
+
+  const response = await withRetries(
+    () =>
+      client.responses.create({
+        model: openaiAiModel,
+        input: [
+          {
+            role: "system",
+            content:
+              "You turn voice-app logs into a PLAIN-TEXT task list for THE UPCOMING WEEK. The user message states the exact calendar window (inclusive, user's local timezone). Use ONLY the excerpts: list tasks, reminders, appointments, and follow-ups that clearly apply to dates inside that window, OR preparation steps explicitly needed before something in that window. For EACH distinct speaker/person name, output their name once as a line in ALL CAPS, then lines starting with • for each task (one task per line). If someone has nothing relevant, still include their header and a single line: • (none noted for this week). Order speakers alphabetically by first name if possible, else by first appearance in logs. If the logs contain no week-relevant tasks for anyone, say so in one short paragraph in report. Do not use markdown. Do not invent tasks or dates. Return strict JSON { report: string }.",
+          },
+          {
+            role: "user",
+            content: `Planning window: ${win}\n\n---\n${contextText.slice(0, 12000)}`,
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "week_tasks_report",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                report: { type: "string" },
+              },
+              required: ["report"],
+            },
+          },
+        },
+      }),
+    { label: "OpenAI.buildWeekTasksReport" },
+  );
+
+  const raw = response.output_text || "{}";
+  const parsed = JSON.parse(raw);
+  return typeof parsed.report === "string" ? parsed.report.trim() : "";
+};
+
 const fetchDrivingDurationWithTraffic = async (originLat, originLng, destination) => {
+  const googleMapsApiKey = getGoogleMapsApiKey();
   if (!googleMapsApiKey) {
     throw new Error("GOOGLE_MAPS_API_KEY is not configured on the server.");
   }
@@ -397,12 +458,19 @@ const fetchDrivingDurationWithTraffic = async (originLat, originLng, destination
   const res = await fetch(url);
   const data = await res.json();
   if (data.status !== "OK" || !Array.isArray(data.routes) || data.routes.length === 0) {
-    const msg =
+    let msg =
       typeof data.error_message === "string" && data.error_message.trim()
-        ? data.error_message
+        ? data.error_message.trim()
         : typeof data.status === "string"
           ? data.status
           : "Directions request failed.";
+    const keyProblem =
+      data.status === "REQUEST_DENIED" ||
+      /api key is invalid|invalid api key|API key not valid|expired|malformed|GOOGLE_API_KEY/i.test(msg);
+    if (keyProblem) {
+      msg +=
+        " For server traffic, use a key with Directions API + billing enabled. Restriction must not be Android/iOS-only (Cloud Run cannot use those); use “None” or an IP/server key.";
+    }
     throw new Error(msg);
   }
   const leg = data.routes[0].legs[0];
@@ -1758,6 +1826,27 @@ app.post("/ai/extract-destination", async (req, res) => {
     return res.json({ destination });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Destination extraction failed.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/ai/week-tasks", async (req, res) => {
+  try {
+    if (!openaiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured." });
+    }
+    const windowLabel = typeof req.body?.windowLabel === "string" ? req.body.windowLabel : "";
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text.trim()) {
+      return res.status(400).json({ error: "Missing log bundle for week tasks." });
+    }
+    const report = await buildWeekTasksReport(windowLabel, text);
+    if (!report) {
+      return res.status(500).json({ error: "Could not generate week tasks report." });
+    }
+    return res.json({ report });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Week tasks failed.";
     return res.status(500).json({ error: message });
   }
 });
