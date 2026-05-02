@@ -1,4 +1,5 @@
 import { StatusBar } from "expo-status-bar";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -740,7 +741,7 @@ export default function App() {
   const [speakerHintModal, setSpeakerHintModal] = useState<{ name: string; draft: string } | null>(null);
   const [isSavingSpeakerHint, setIsSavingSpeakerHint] = useState(false);
   const [hasLoadedHistory, setHasLoadedHistory] = useState(false);
-  const [statusText, setStatusText] = useState("Tap the mic and start speaking.");
+  const [statusText, setStatusText] = useState("Tap the mic — we’ll handle the rest.");
   const [errorText, setErrorText] = useState<string | null>(null);
   /** Should match API `SPEAKER_MATCH_THRESHOLD` (same default 0.97) so conflict prompts align with server gating. */
   const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.97");
@@ -749,6 +750,10 @@ export default function App() {
   const lastAutoExpandedHistoryIdRef = useRef<string | null>(null);
   const [unknownSpeakerModalVisible, setUnknownSpeakerModalVisible] = useState(false);
   const [unknownSpeakerDraft, setUnknownSpeakerDraft] = useState("");
+  const enrollTargetNameRef = useRef<string | null>(null);
+  const [enrollTargetName, setEnrollTargetName] = useState<string | null>(null);
+  const [enrollSpeakerModalVisible, setEnrollSpeakerModalVisible] = useState(false);
+  const [enrollNameDraft, setEnrollNameDraft] = useState("");
 
   const closeUnknownSpeakerPrompt = (value: string) => {
     setUnknownSpeakerModalVisible(false);
@@ -775,7 +780,8 @@ export default function App() {
 
   const canShowTranscript = useMemo(() => transcript.length > 0, [transcript]);
   const isRecording = recording !== null;
-  const isBusy = isRecording || isUploading || unknownSpeakerModalVisible;
+  const isBusy =
+    isRecording || isUploading || unknownSpeakerModalVisible || enrollSpeakerModalVisible;
 
   const createTimeLabel = (timestampMs: number) =>
     new Date(timestampMs).toLocaleTimeString(undefined, {
@@ -1133,6 +1139,10 @@ export default function App() {
     ]);
   };
 
+  const clearTranscript = () => {
+    setTranscript("");
+  };
+
   const toggleHistoryItemExpanded = (historyId: string) => {
     setExpandedHistoryIds((current) =>
       current.includes(historyId)
@@ -1246,7 +1256,7 @@ export default function App() {
     });
   }, [history, hasLoadedHistory]);
 
-  const handleRecordPress = async () => {
+  const handleRecordPress = async (opts?: { fromEnrollModal?: boolean }) => {
     if (isUploading) {
       return;
     }
@@ -1263,6 +1273,104 @@ export default function App() {
 
         if (!uri) {
           throw new Error("No recording file found.");
+        }
+
+        const enrollName = enrollTargetNameRef.current;
+        enrollTargetNameRef.current = null;
+        setEnrollTargetName(null);
+
+        if (enrollName) {
+          const createdAtMs = Date.now();
+          const historyClientId = `${createdAtMs}`;
+          let transcriptionDiagnosticsEnrollment: TranscriptionDiagnosticsPhase | undefined;
+          let voiceEnrollmentRequestFailed = false;
+          let result: TranscriptionResult;
+          try {
+            result = await transcribeAudio(uri, enrollName, {
+              enrollmentSource: "speaker_name_input",
+              historyClientId,
+            });
+          } catch (enrollErr) {
+            voiceEnrollmentRequestFailed = true;
+            const enrollMessage =
+              enrollErr instanceof Error
+                ? enrollErr.message
+                : "Voice profile could not be saved on the server.";
+            setErrorText(enrollMessage);
+            setStatusText("Enrollment failed — try again.");
+            setIsUploading(false);
+            return;
+          }
+          if (result.transcriptionDiagnostics) {
+            transcriptionDiagnosticsEnrollment = readDiagnosticsPhase({
+              ...result.transcriptionDiagnostics,
+              phase: "enrollment",
+            });
+          }
+          const text = result.text;
+          let normalizedSpeakerName = result.enrolledSpeakerName || enrollName;
+          let speakerAttributionSource: SpeakerAttributionSource = "speaker_name_input";
+          let wasConflictPromptShown = false;
+          let wasVoiceMatchUsed = false;
+          const hasServerDetectedSpeaker = !!result.detectedSpeakerName?.trim();
+          const hasConfidentDetectedForConflict =
+            hasServerDetectedSpeaker &&
+            result.speakerConfidence !== null &&
+            result.speakerConfidence >= speakerAutoAssignMinConfidence;
+
+          if (hasConfidentDetectedForConflict && result.detectedSpeakerName) {
+            wasConflictPromptShown = true;
+            const confirmed = await resolveSpeakerNameConflict(
+              enrollName,
+              result,
+              speakerAutoAssignMinConfidence,
+            );
+            normalizedSpeakerName = confirmed || normalizedSpeakerName;
+            speakerAttributionSource =
+              normalizeSpeakerKey(confirmed) === normalizeSpeakerKey(result.detectedSpeakerName)
+                ? "voice_match"
+                : "speaker_conflict_prompt";
+            wasVoiceMatchUsed = speakerAttributionSource === "voice_match";
+          }
+
+          setTranscript(text);
+          setLastSpeakerName(normalizedSpeakerName);
+          const newHistoryEntry: TranscriptLogItem = {
+            id: historyClientId,
+            speakerName: normalizedSpeakerName,
+            text,
+            createdAt: createTimeLabel(createdAtMs),
+            createdAtMs,
+            speakerAttributionSource,
+            speakerNameInput: enrollName,
+            promptedSpeakerName: null,
+            detectedSpeakerName: result.detectedSpeakerName,
+            speakerConfidence: result.speakerConfidence,
+            matchedEnrollmentSampleId: result.detectedSpeakerSampleId,
+            matchedEnrollmentSampleSource: result.detectedSpeakerSampleSource,
+            matchedEnrollmentSampleCreatedAtIso: result.detectedSpeakerSampleCreatedAtIso,
+            assemblySpeakerLabel: result.assemblySpeakerLabel,
+            wasSpeakerNameInputProvided: true,
+            wasUnknownSpeakerPromptShown: false,
+            wasVoiceMatchUsed,
+            wasConflictPromptShown,
+            wasVoiceProfileEnrolled: !voiceEnrollmentRequestFailed,
+            ...(transcriptionDiagnosticsEnrollment
+              ? { transcriptionDiagnosticsEnrollment }
+              : {}),
+          };
+          setHistory((current) => [{ ...newHistoryEntry }, ...current]);
+          void saveHistoryEntryToCloud(newHistoryEntry);
+          void fetchSpeakers(true);
+          if (!voiceEnrollmentRequestFailed) {
+            setStatusText(
+              text
+                ? `Voice saved for ${normalizedSpeakerName}. Transcript ready.`
+                : `Voice saved for ${normalizedSpeakerName} — record again for speech text.`,
+            );
+          }
+          setIsUploading(false);
+          return;
         }
 
         const createdAtMs = Date.now();
@@ -1389,7 +1497,6 @@ export default function App() {
           ...(transcriptionDiagnosticsInitial ? { transcriptionDiagnosticsInitial } : {}),
           ...(transcriptionDiagnosticsEnrollment ? { transcriptionDiagnosticsEnrollment } : {}),
         };
-        const nextHistory = [newHistoryEntry, ...history];
         setHistory((current) => [
           {
             ...newHistoryEntry,
@@ -1411,7 +1518,13 @@ export default function App() {
             setStatusText(text ? "Transcription complete." : "No speech detected.");
           }
         }
+        setIsUploading(false);
         return;
+      }
+
+      if (!opts?.fromEnrollModal) {
+        enrollTargetNameRef.current = null;
+        setEnrollTargetName(null);
       }
 
       const permission = await Audio.requestPermissionsAsync();
@@ -1427,7 +1540,10 @@ export default function App() {
       });
 
       setTranscript("");
-      setStatusText("Listening...");
+      const recordingFor = enrollTargetNameRef.current;
+      setStatusText(
+        recordingFor ? `Recording voice sample for ${recordingFor}…` : "Listening…",
+      );
       const { recording: nextRecording } = await Audio.Recording.createAsync(
         Audio.RecordingOptionsPresets.HIGH_QUALITY,
       );
@@ -1440,9 +1556,34 @@ export default function App() {
       setStatusText("Could not transcribe.");
       setErrorText(message);
       setRecording(null);
+      enrollTargetNameRef.current = null;
+      setEnrollTargetName(null);
     } finally {
       setIsUploading(false);
     }
+  };
+
+  const openEnrollSpeakerFlow = () => {
+    if (isUploading || isRecording) {
+      return;
+    }
+    setEnrollNameDraft("");
+    setEnrollSpeakerModalVisible(true);
+  };
+
+  const commitEnrollAndStartRecording = () => {
+    const name = enrollNameDraft.trim();
+    if (!name) {
+      return;
+    }
+    if (isUploading || isRecording) {
+      return;
+    }
+    setEnrollSpeakerModalVisible(false);
+    setEnrollNameDraft("");
+    enrollTargetNameRef.current = name;
+    setEnrollTargetName(name);
+    void handleRecordPress({ fromEnrollModal: true });
   };
 
   const latestHistoryItem = useMemo(() => {
@@ -1560,6 +1701,67 @@ export default function App() {
         </View>
       </Modal>
       <Modal
+        visible={enrollSpeakerModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setEnrollSpeakerModalVisible(false);
+          setEnrollNameDraft("");
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={() => {
+              setEnrollSpeakerModalVisible(false);
+              setEnrollNameDraft("");
+            }}
+          />
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Enroll a speaker</Text>
+            <Text style={styles.modalSubtitle}>
+              Add a voice sample for someone already on your mind — no need to wait for a failed match. We’ll record a
+              clip, save their fingerprint (and embedding when available), and transcribe what they said.
+            </Text>
+            <TextInput
+              style={[styles.modalInput, styles.modalInputSingleLine]}
+              placeholder="Their name"
+              placeholderTextColor="#6b769e"
+              value={enrollNameDraft}
+              onChangeText={(text) => setEnrollNameDraft(text.slice(0, UNKNOWN_SPEAKER_NAME_MAX_CHARS))}
+              maxLength={UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+              autoCapitalize="words"
+              autoFocus
+            />
+            <Text style={styles.modalCharCount}>
+              {enrollNameDraft.length}/{UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => {
+                  setEnrollSpeakerModalVisible(false);
+                  setEnrollNameDraft("");
+                }}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.modalButton,
+                  styles.modalButtonPrimary,
+                  !enrollNameDraft.trim() && styles.modalButtonDisabled,
+                ]}
+                disabled={!enrollNameDraft.trim()}
+                onPress={commitEnrollAndStartRecording}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Record sample</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
         visible={unknownSpeakerModalVisible}
         transparent
         animationType="fade"
@@ -1610,8 +1812,8 @@ export default function App() {
         </View>
       </Modal>
       <View style={styles.card}>
-        <Text style={styles.kicker}>VOICE TO TEXT</Text>
-        <Text style={styles.title}>Speak. Capture. Review.</Text>
+        <Text style={styles.kicker}>VOICELINE</Text>
+        <Text style={styles.title}>Your voice, printed live.</Text>
         <Text style={styles.subtitle}>{statusText}</Text>
 
         <View style={styles.tabBar}>
@@ -1646,24 +1848,81 @@ export default function App() {
         {activeTab === "record" ? (
           <View style={styles.tabContent}>
             <Text style={styles.tabIntro}>
-              Start recording to auto-detect the speaker. If no enrolled voice matches, the app will ask who was speaking.
+              Tap the mic to transcribe with auto speaker ID — or the badge to add a new voice on purpose.
             </Text>
 
-            <Pressable
-              style={[styles.recordButton, isBusy && styles.recordButtonActive]}
-              onPress={handleRecordPress}
-            >
-              <Text style={styles.recordButtonText}>
-                {isUploading
-                  ? "Transcribing..."
-                  : isRecording
-                    ? "Stop Recording"
-                    : "Start Recording"}
-              </Text>
-            </Pressable>
+            {enrollTargetName ? (
+              <View style={styles.enrollChip}>
+                <Ionicons
+                  name={isRecording ? "ellipse" : "person"}
+                  size={14}
+                  color="#a8b9ff"
+                />
+                <Text style={styles.enrollChipText}>
+                  {isRecording ? `Recording sample for ${enrollTargetName}` : `Enroll: ${enrollTargetName}`}
+                </Text>
+              </View>
+            ) : null}
+
+            <View style={styles.recordHeroRow}>
+              <View style={styles.heroControlCol}>
+                <Pressable
+                  style={[styles.enrollOrb, isBusy && styles.controlDisabled]}
+                  disabled={isBusy}
+                  onPress={openEnrollSpeakerFlow}
+                  accessibilityRole="button"
+                  accessibilityLabel="Enroll speaker"
+                >
+                  <Ionicons name="person-add-sharp" size={26} color="#dbe2ff" />
+                </Pressable>
+              </View>
+
+              <Pressable
+                style={[
+                  styles.fabPrimary,
+                  isRecording && styles.fabRecording,
+                  isUploading && styles.fabUploading,
+                ]}
+                onPress={() => void handleRecordPress()}
+                disabled={isUploading}
+                accessibilityRole="button"
+                accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
+              >
+                {isUploading ? (
+                  <ActivityIndicator color="#fff" size="large" />
+                ) : (
+                  <Ionicons
+                    name={isRecording ? "stop" : "mic"}
+                    size={38}
+                    color={isRecording ? "#1a1528" : "#ffffff"}
+                  />
+                )}
+              </Pressable>
+
+              <View style={styles.heroControlCol} />
+            </View>
+            <Text style={styles.heroCaption}>
+              {isUploading
+                ? "Working…"
+                : isRecording
+                  ? "Tap the mic to stop"
+                  : "Tap the center to listen"}
+            </Text>
 
             <View style={styles.transcriptPanel}>
-              <Text style={styles.panelTitle}>Transcript</Text>
+              <View style={styles.transcriptPanelHeader}>
+                <Text style={styles.transcriptPanelTitle}>Transcript</Text>
+                <Pressable
+                  style={[
+                    styles.clearTranscriptButton,
+                    (!canShowTranscript || isBusy) && styles.clearTranscriptButtonDisabled,
+                  ]}
+                  disabled={!canShowTranscript || isBusy}
+                  onPress={clearTranscript}
+                >
+                  <Text style={styles.clearTranscriptButtonText}>Clear</Text>
+                </Pressable>
+              </View>
               <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
               <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
                 <Text style={styles.transcriptText}>
@@ -1986,38 +2245,43 @@ export default function App() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: "#0b1020",
+    backgroundColor: "#070b16",
     justifyContent: "flex-start",
     paddingHorizontal: 20,
     paddingVertical: 20,
   },
   card: {
     borderRadius: 24,
-    backgroundColor: "#141b34",
-    padding: 20,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.22,
-    shadowRadius: 20,
-    elevation: 8,
+    backgroundColor: "#12182e",
+    padding: 22,
+    borderWidth: 1,
+    borderColor: "rgba(110, 132, 255, 0.22)",
+    shadowColor: "#3d4fd9",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.35,
+    shadowRadius: 28,
+    elevation: 12,
   },
   kicker: {
-    color: "#8ea1ff",
-    fontSize: 12,
-    fontWeight: "700",
-    letterSpacing: 1.4,
-    marginBottom: 8,
+    color: "#9eb2ff",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 2.2,
+    marginBottom: 10,
   },
   title: {
-    color: "#f5f7ff",
-    fontSize: 26,
-    fontWeight: "700",
+    color: "#f8f9ff",
+    fontSize: 28,
+    fontWeight: "800",
+    letterSpacing: -0.5,
+    lineHeight: 34,
   },
   subtitle: {
-    color: "#b9c1dd",
-    marginTop: 8,
-    marginBottom: 14,
+    color: "#98a8d4",
+    marginTop: 10,
+    marginBottom: 16,
     fontSize: 14,
+    lineHeight: 20,
   },
   tabBar: {
     flexDirection: "row",
@@ -2037,7 +2301,12 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   tabButtonActive: {
-    backgroundColor: "#6a7cff",
+    backgroundColor: "#5f6fff",
+    shadowColor: "#5f6fff",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    elevation: 4,
   },
   tabButtonText: {
     color: "#9ba8d8",
@@ -2058,10 +2327,11 @@ const styles = StyleSheet.create({
     paddingBottom: 18,
   },
   tabIntro: {
-    color: "#9aaad8",
+    color: "#8898cc",
     fontSize: 12,
-    lineHeight: 17,
-    marginBottom: 10,
+    lineHeight: 18,
+    marginBottom: 14,
+    textAlign: "center",
   },
   tabPanel: {
     marginTop: 2,
@@ -2085,20 +2355,84 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
   },
-  recordButton: {
-    backgroundColor: "#6a7cff",
-    borderRadius: 14,
+  recordHeroRow: {
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 14,
-    marginBottom: 10,
+    marginTop: 8,
+    marginBottom: 6,
   },
-  recordButtonActive: {
-    backgroundColor: "#ff6b7d",
+  heroControlCol: {
+    width: 68,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  recordButtonText: {
-    color: "#ffffff",
-    fontSize: 16,
+  enrollOrb: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: "rgba(42, 58, 120, 0.85)",
+    borderWidth: 1,
+    borderColor: "rgba(124, 148, 255, 0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#4d62ff",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  fabPrimary: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: "#5f6fff",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+    shadowColor: "#6f7cff",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.55,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  fabRecording: {
+    backgroundColor: "#ff5c7a",
+    borderColor: "rgba(255,255,255,0.25)",
+    shadowColor: "#ff3d6a",
+  },
+  fabUploading: {
+    backgroundColor: "#4a5588",
+    opacity: 0.9,
+  },
+  controlDisabled: {
+    opacity: 0.45,
+  },
+  heroCaption: {
+    textAlign: "center",
+    color: "#7a88ba",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 8,
+    letterSpacing: 0.2,
+  },
+  enrollChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "center",
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "rgba(80, 102, 200, 0.2)",
+    borderWidth: 1,
+    borderColor: "rgba(120, 142, 255, 0.35)",
+    marginBottom: 12,
+  },
+  enrollChipText: {
+    color: "#c3ceff",
+    fontSize: 12,
     fontWeight: "700",
   },
   historyToggleButton: {
@@ -2128,6 +2462,34 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#202c55",
     minHeight: 220,
+  },
+  transcriptPanelHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginHorizontal: 14,
+    marginTop: 14,
+  },
+  transcriptPanelTitle: {
+    color: "#aeb8df",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  clearTranscriptButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#5a6bb5",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: "#1a2548",
+  },
+  clearTranscriptButtonDisabled: {
+    opacity: 0.4,
+  },
+  clearTranscriptButtonText: {
+    color: "#c9d4ff",
+    fontSize: 12,
+    fontWeight: "600",
   },
   panelTitle: {
     color: "#aeb8df",
