@@ -1812,8 +1812,7 @@ export default function App() {
         </View>
       </Modal>
       <View style={styles.card}>
-        <Text style={styles.kicker}>VOICELINE</Text>
-        <Text style={styles.title}>Your voice, printed live.</Text>
+        <Text style={styles.kicker}>Just Speak</Text>
         <Text style={styles.subtitle}>{statusText}</Text>
 
         <View style={styles.tabBar}>
@@ -2263,22 +2262,16 @@ const styles = StyleSheet.create({
     elevation: 12,
   },
   kicker: {
-    color: "#9eb2ff",
-    fontSize: 11,
+    color: "#f4f6ff",
+    fontSize: 32,
     fontWeight: "800",
-    letterSpacing: 2.2,
-    marginBottom: 10,
-  },
-  title: {
-    color: "#f8f9ff",
-    fontSize: 28,
-    fontWeight: "800",
-    letterSpacing: -0.5,
-    lineHeight: 34,
+    letterSpacing: -0.6,
+    lineHeight: 38,
+    marginBottom: 6,
   },
   subtitle: {
     color: "#98a8d4",
-    marginTop: 10,
+    marginTop: 6,
     marginBottom: 16,
     fontSize: 14,
     lineHeight: 20,
