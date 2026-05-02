@@ -1,5 +1,6 @@
 import { StatusBar } from "expo-status-bar";
 import Ionicons from "@expo/vector-icons/Ionicons";
+import { LinearGradient } from "expo-linear-gradient";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -7,6 +8,7 @@ import { EncodingType, readAsStringAsync } from "expo-file-system/legacy";
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Modal,
   Platform,
   Pressable,
@@ -1141,6 +1143,8 @@ export default function App() {
 
   const clearTranscript = () => {
     setTranscript("");
+    setLastSpeakerName(UNKNOWN_SPEAKER_LABEL);
+    setStatusText("Tap the mic — we’ll handle the rest.");
   };
 
   const toggleHistoryItemExpanded = (historyId: string) => {
@@ -1635,8 +1639,9 @@ export default function App() {
   }, [history]);
 
   return (
+    <View style={styles.appRoot}>
     <SafeAreaView style={styles.screen}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
       <Modal
         visible={speakerHintModal !== null}
         transparent
@@ -1656,7 +1661,7 @@ export default function App() {
             <TextInput
               style={styles.modalInput}
               placeholder="e.g. British accent, soft voice, usually discusses budgets…"
-              placeholderTextColor="#6b769e"
+              placeholderTextColor="#94a3b8"
               value={speakerHintModal?.draft ?? ""}
               onChangeText={(text) =>
                 setSpeakerHintModal((current) =>
@@ -1726,7 +1731,7 @@ export default function App() {
             <TextInput
               style={[styles.modalInput, styles.modalInputSingleLine]}
               placeholder="Their name"
-              placeholderTextColor="#6b769e"
+              placeholderTextColor="#94a3b8"
               value={enrollNameDraft}
               onChangeText={(text) => setEnrollNameDraft(text.slice(0, UNKNOWN_SPEAKER_NAME_MAX_CHARS))}
               maxLength={UNKNOWN_SPEAKER_NAME_MAX_CHARS}
@@ -1779,7 +1784,7 @@ export default function App() {
             <TextInput
               style={[styles.modalInput, styles.modalInputSingleLine]}
               placeholder="e.g. Alice"
-              placeholderTextColor="#6b769e"
+              placeholderTextColor="#94a3b8"
               value={unknownSpeakerDraft}
               onChangeText={(text) => setUnknownSpeakerDraft(text.slice(0, UNKNOWN_SPEAKER_NAME_MAX_CHARS))}
               maxLength={UNKNOWN_SPEAKER_NAME_MAX_CHARS}
@@ -1812,8 +1817,24 @@ export default function App() {
         </View>
       </Modal>
       <View style={styles.card}>
-        <Text style={styles.kicker}>VOICELINE</Text>
-        <Text style={styles.title}>Your voice, printed live.</Text>
+        <View style={styles.cardHeaderRow}>
+          <View style={styles.cardHeaderMain}>
+            <Text style={styles.kicker}>Just Speak</Text>
+            <LinearGradient
+              colors={["transparent", "rgba(249, 115, 22, 0.65)", "transparent"]}
+              start={{ x: 0, y: 0.5 }}
+              end={{ x: 1, y: 0.5 }}
+              style={styles.headlineAccent}
+            />
+          </View>
+          <Image
+            source={require("./assets/family-hero.png")}
+            style={styles.familyMascot}
+            resizeMode="cover"
+            accessibilityIgnoresInvertColors
+            accessibilityLabel="Family illustration"
+          />
+        </View>
         <Text style={styles.subtitle}>{statusText}</Text>
 
         <View style={styles.tabBar}>
@@ -1821,25 +1842,46 @@ export default function App() {
             style={[styles.tabButton, activeTab === "record" && styles.tabButtonActive]}
             onPress={() => setActiveTab("record")}
           >
-            <Text style={[styles.tabButtonText, activeTab === "record" && styles.tabButtonTextActive]}>
-              Record
-            </Text>
+            <View style={styles.tabButtonInner}>
+              <Ionicons
+                name="mic"
+                size={16}
+                color={activeTab === "record" ? "#ffffff" : "#64748b"}
+              />
+              <Text style={[styles.tabButtonText, activeTab === "record" && styles.tabButtonTextActive]}>
+                Record
+              </Text>
+            </View>
           </Pressable>
           <Pressable
             style={[styles.tabButton, activeTab === "history" && styles.tabButtonActive]}
             onPress={() => setActiveTab("history")}
           >
-            <Text style={[styles.tabButtonText, activeTab === "history" && styles.tabButtonTextActive]}>
-              History
-            </Text>
+            <View style={styles.tabButtonInner}>
+              <Ionicons
+                name="time-outline"
+                size={17}
+                color={activeTab === "history" ? "#ffffff" : "#64748b"}
+              />
+              <Text style={[styles.tabButtonText, activeTab === "history" && styles.tabButtonTextActive]}>
+                History
+              </Text>
+            </View>
           </Pressable>
           <Pressable
             style={[styles.tabButton, activeTab === "speakers" && styles.tabButtonActive]}
             onPress={() => setActiveTab("speakers")}
           >
-            <Text style={[styles.tabButtonText, activeTab === "speakers" && styles.tabButtonTextActive]}>
-              Speakers
-            </Text>
+            <View style={styles.tabButtonInner}>
+              <Ionicons
+                name="people-outline"
+                size={17}
+                color={activeTab === "speakers" ? "#ffffff" : "#64748b"}
+              />
+              <Text style={[styles.tabButtonText, activeTab === "speakers" && styles.tabButtonTextActive]}>
+                Speakers
+              </Text>
+            </View>
           </Pressable>
         </View>
 
@@ -1856,7 +1898,7 @@ export default function App() {
                 <Ionicons
                   name={isRecording ? "ellipse" : "person"}
                   size={14}
-                  color="#a8b9ff"
+                  color="#0f766e"
                 />
                 <Text style={styles.enrollChipText}>
                   {isRecording ? `Recording sample for ${enrollTargetName}` : `Enroll: ${enrollTargetName}`}
@@ -1873,7 +1915,7 @@ export default function App() {
                   accessibilityRole="button"
                   accessibilityLabel="Enroll speaker"
                 >
-                  <Ionicons name="person-add-sharp" size={26} color="#dbe2ff" />
+                  <Ionicons name="person-add-sharp" size={26} color="#0f766e" />
                 </Pressable>
               </View>
 
@@ -1894,7 +1936,7 @@ export default function App() {
                   <Ionicons
                     name={isRecording ? "stop" : "mic"}
                     size={38}
-                    color={isRecording ? "#1a1528" : "#ffffff"}
+                    color="#ffffff"
                   />
                 )}
               </Pressable>
@@ -1923,7 +1965,9 @@ export default function App() {
                   <Text style={styles.clearTranscriptButtonText}>Clear</Text>
                 </Pressable>
               </View>
-              <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
+              {canShowTranscript ? (
+                <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
+              ) : null}
               <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
                 <Text style={styles.transcriptText}>
                   {canShowTranscript
@@ -2239,77 +2283,117 @@ export default function App() {
         ) : null}
       </View>
     </SafeAreaView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  appRoot: {
+    flex: 1,
+    backgroundColor: "#f5f3ef",
+  },
   screen: {
     flex: 1,
-    backgroundColor: "#070b16",
+    backgroundColor: "transparent",
     justifyContent: "flex-start",
-    paddingHorizontal: 20,
-    paddingVertical: 20,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+  },
+  cardHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginBottom: 2,
+  },
+  cardHeaderMain: {
+    flex: 1,
+    minWidth: 0,
+    alignItems: "center",
+  },
+  familyMascot: {
+    width: 76,
+    height: 76,
+    borderRadius: 16,
+    borderWidth: 2,
+    borderColor: "rgba(20, 184, 166, 0.3)",
+    backgroundColor: "#fffefb",
   },
   card: {
-    borderRadius: 24,
-    backgroundColor: "#12182e",
-    padding: 22,
-    borderWidth: 1,
-    borderColor: "rgba(110, 132, 255, 0.22)",
-    shadowColor: "#3d4fd9",
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.35,
-    shadowRadius: 28,
-    elevation: 12,
+    borderRadius: 26,
+    backgroundColor: "rgba(255, 255, 255, 0.88)",
+    paddingVertical: 22,
+    paddingHorizontal: 20,
+    borderWidth: 1.5,
+    borderColor: "rgba(253, 186, 116, 0.45)",
+    overflow: "hidden",
+    shadowColor: "#0d9488",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 24,
+    elevation: 8,
   },
   kicker: {
-    color: "#9eb2ff",
-    fontSize: 11,
+    color: "#0f172a",
+    fontSize: 32,
     fontWeight: "800",
-    letterSpacing: 2.2,
-    marginBottom: 10,
+    letterSpacing: -0.8,
+    lineHeight: 38,
+    marginBottom: 4,
+    textAlign: "center",
+    alignSelf: "stretch",
   },
-  title: {
-    color: "#f8f9ff",
-    fontSize: 28,
-    fontWeight: "800",
-    letterSpacing: -0.5,
-    lineHeight: 34,
+  headlineAccent: {
+    alignSelf: "center",
+    width: 112,
+    height: 3,
+    borderRadius: 2,
+    marginBottom: 12,
+    marginTop: 2,
   },
   subtitle: {
-    color: "#98a8d4",
-    marginTop: 10,
-    marginBottom: 16,
+    color: "#334155",
+    marginTop: 0,
+    marginBottom: 18,
     fontSize: 14,
     lineHeight: 20,
+    textAlign: "center",
+    fontWeight: "500",
+    opacity: 1,
   },
   tabBar: {
     flexDirection: "row",
-    gap: 8,
-    marginBottom: 14,
-    borderRadius: 14,
-    backgroundColor: "#0f152b",
+    gap: 6,
+    marginBottom: 16,
+    borderRadius: 16,
+    backgroundColor: "rgba(255, 255, 255, 0.75)",
     borderWidth: 1,
-    borderColor: "#202c55",
-    padding: 4,
+    borderColor: "rgba(20, 184, 166, 0.25)",
+    padding: 5,
   },
   tabButton: {
     flex: 1,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 9,
+    paddingVertical: 10,
+  },
+  tabButtonInner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
   },
   tabButtonActive: {
-    backgroundColor: "#5f6fff",
-    shadowColor: "#5f6fff",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.35,
-    shadowRadius: 6,
+    backgroundColor: "#14b8a6",
+    borderWidth: 1,
+    borderColor: "rgba(204, 251, 241, 0.8)",
+    shadowColor: "#0d9488",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.22,
+    shadowRadius: 8,
     elevation: 4,
   },
   tabButtonText: {
-    color: "#9ba8d8",
+    color: "#475569",
     fontSize: 12,
     fontWeight: "700",
   },
@@ -2327,11 +2411,12 @@ const styles = StyleSheet.create({
     paddingBottom: 18,
   },
   tabIntro: {
-    color: "#8898cc",
+    color: "#334155",
     fontSize: 12,
     lineHeight: 18,
-    marginBottom: 14,
+    marginBottom: 16,
     textAlign: "center",
+    fontWeight: "500",
   },
   tabPanel: {
     marginTop: 2,
@@ -2343,17 +2428,18 @@ const styles = StyleSheet.create({
   },
   smallActionButton: {
     flex: 1,
-    borderRadius: 10,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#4e5fa9",
+    borderColor: "rgba(20, 184, 166, 0.4)",
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 8,
+    paddingVertical: 10,
+    backgroundColor: "rgba(204, 251, 241, 0.5)",
   },
   smallActionButtonText: {
-    color: "#d7deff",
+    color: "#115e59",
     fontSize: 12,
-    fontWeight: "600",
+    fontWeight: "700",
   },
   recordHeroRow: {
     flexDirection: "row",
@@ -2368,70 +2454,70 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   enrollOrb: {
-    width: 54,
-    height: 54,
-    borderRadius: 27,
-    backgroundColor: "rgba(42, 58, 120, 0.85)",
-    borderWidth: 1,
-    borderColor: "rgba(124, 148, 255, 0.45)",
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: "rgba(255, 251, 235, 0.95)",
+    borderWidth: 2,
+    borderColor: "rgba(251, 191, 36, 0.55)",
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: "#4d62ff",
+    shadowColor: "#f59e0b",
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
+    shadowOpacity: 0.15,
+    shadowRadius: 10,
     elevation: 6,
   },
   fabPrimary: {
-    width: 88,
-    height: 88,
-    borderRadius: 44,
-    backgroundColor: "#5f6fff",
+    width: 92,
+    height: 92,
+    borderRadius: 46,
+    backgroundColor: "#14b8a6",
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.2)",
-    shadowColor: "#6f7cff",
+    borderWidth: 3,
+    borderColor: "rgba(255, 255, 255, 0.85)",
+    shadowColor: "#0d9488",
     shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.55,
+    shadowOpacity: 0.28,
     shadowRadius: 16,
     elevation: 10,
   },
   fabRecording: {
-    backgroundColor: "#ff5c7a",
-    borderColor: "rgba(255,255,255,0.25)",
-    shadowColor: "#ff3d6a",
+    backgroundColor: "#f43f5e",
+    borderColor: "rgba(255, 255, 255, 0.9)",
+    shadowColor: "#fb7185",
   },
   fabUploading: {
-    backgroundColor: "#4a5588",
-    opacity: 0.9,
+    backgroundColor: "#94a3b8",
+    opacity: 0.95,
   },
   controlDisabled: {
     opacity: 0.45,
   },
   heroCaption: {
     textAlign: "center",
-    color: "#7a88ba",
+    color: "#57534e",
     fontSize: 12,
     fontWeight: "600",
-    marginBottom: 8,
-    letterSpacing: 0.2,
+    marginBottom: 10,
+    letterSpacing: 0.15,
   },
   enrollChip: {
     flexDirection: "row",
     alignItems: "center",
     alignSelf: "center",
     gap: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 9,
     borderRadius: 999,
-    backgroundColor: "rgba(80, 102, 200, 0.2)",
+    backgroundColor: "rgba(204, 251, 241, 0.85)",
     borderWidth: 1,
-    borderColor: "rgba(120, 142, 255, 0.35)",
-    marginBottom: 12,
+    borderColor: "rgba(20, 184, 166, 0.4)",
+    marginBottom: 14,
   },
   enrollChipText: {
-    color: "#c3ceff",
+    color: "#115e59",
     fontSize: 12,
     fontWeight: "700",
   },
@@ -2439,28 +2525,29 @@ const styles = StyleSheet.create({
     marginTop: 2,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#4e5fa9",
+    borderColor: "rgba(20, 184, 166, 0.55)",
+    backgroundColor: "rgba(255, 255, 255, 0.55)",
     alignItems: "center",
     justifyContent: "center",
     paddingVertical: 10,
   },
   historyToggleButtonText: {
-    color: "#d7deff",
+    color: "#115e59",
     fontSize: 14,
     fontWeight: "600",
   },
   errorText: {
-    color: "#ff98a6",
+    color: "#dc2626",
     fontSize: 13,
     marginTop: 6,
     marginBottom: 10,
   },
   transcriptPanel: {
     marginTop: 14,
-    borderRadius: 14,
-    backgroundColor: "#0f152b",
+    borderRadius: 18,
+    backgroundColor: "#eef6f4",
     borderWidth: 1,
-    borderColor: "#202c55",
+    borderColor: "rgba(15, 118, 110, 0.28)",
     minHeight: 220,
   },
   transcriptPanelHeader: {
@@ -2471,36 +2558,37 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   transcriptPanelTitle: {
-    color: "#aeb8df",
+    color: "#0f172a",
     fontSize: 13,
-    fontWeight: "600",
+    fontWeight: "700",
   },
   clearTranscriptButton: {
-    borderRadius: 8,
+    borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#5a6bb5",
+    borderColor: "rgba(249, 115, 22, 0.5)",
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: "#1a2548",
+    paddingVertical: 7,
+    backgroundColor: "rgba(254, 243, 199, 0.65)",
   },
   clearTranscriptButtonDisabled: {
     opacity: 0.4,
   },
   clearTranscriptButtonText: {
-    color: "#c9d4ff",
+    color: "#c2410c",
     fontSize: 12,
-    fontWeight: "600",
+    fontWeight: "700",
   },
   panelTitle: {
-    color: "#aeb8df",
+    color: "#0f172a",
     fontSize: 13,
-    fontWeight: "600",
+    fontWeight: "700",
     marginHorizontal: 14,
     marginTop: 14,
   },
   speakerLabel: {
-    color: "#93a4de",
+    color: "#134e4a",
     fontSize: 12,
+    fontWeight: "700",
     marginHorizontal: 14,
     marginTop: 8,
   },
@@ -2513,16 +2601,16 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
   transcriptText: {
-    color: "#eaf0ff",
+    color: "#0f172a",
     fontSize: 16,
     lineHeight: 24,
   },
   historyPanel: {
     marginTop: 14,
-    borderRadius: 14,
-    backgroundColor: "#0f152b",
+    borderRadius: 18,
+    backgroundColor: "#eef6f4",
     borderWidth: 1,
-    borderColor: "#202c55",
+    borderColor: "rgba(15, 118, 110, 0.28)",
     minHeight: 360,
     maxHeight: 560,
   },
@@ -2540,18 +2628,24 @@ const styles = StyleSheet.create({
     marginRight: 14,
   },
   historyCountText: {
-    color: "#8fa0d8",
+    color: "#334155",
     fontSize: 12,
+    fontWeight: "600",
     marginTop: 14,
   },
   historyItem: {
     marginBottom: 10,
-    borderRadius: 12,
-    backgroundColor: "#131c39",
+    borderRadius: 14,
+    backgroundColor: "#ffffff",
     borderWidth: 1,
-    borderColor: "#253264",
+    borderColor: "rgba(15, 118, 110, 0.32)",
     paddingHorizontal: 12,
     paddingVertical: 10,
+    shadowColor: "#0f172a",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 3,
+    elevation: 2,
   },
   historyGroup: {
     marginBottom: 10,
@@ -2563,9 +2657,9 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   historyGroupTitle: {
-    color: "#b9c7f7",
-    fontSize: 12,
-    fontWeight: "700",
+    color: "#0f172a",
+    fontSize: 13,
+    fontWeight: "800",
     marginLeft: 2,
   },
   historyDateGroup: {
@@ -2579,9 +2673,9 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   historyDateGroupTitle: {
-    color: "#8ea1df",
-    fontSize: 11,
-    fontWeight: "700",
+    color: "#134e4a",
+    fontSize: 12,
+    fontWeight: "800",
     marginLeft: 2,
   },
   historyMetaRow: {
@@ -2597,110 +2691,114 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   historyTimestamp: {
-    color: "#8ea1df",
+    color: "#475569",
     fontSize: 11,
+    fontWeight: "600",
   },
   historySpeaker: {
-    color: "#d5deff",
-    fontSize: 12,
-    fontWeight: "600",
+    color: "#0f172a",
+    fontSize: 13,
+    fontWeight: "700",
   },
   historyExpandHint: {
-    color: "#94a5de",
-    fontSize: 11,
-    fontWeight: "600",
+    color: "#047857",
+    fontSize: 12,
+    fontWeight: "700",
   },
   historyDetailsBox: {
     marginTop: 8,
     borderTopWidth: 1,
-    borderTopColor: "#2a3768",
+    borderTopColor: "rgba(15, 118, 110, 0.22)",
     paddingTop: 8,
   },
   historyText: {
-    color: "#eaf0ff",
-    fontSize: 14,
-    lineHeight: 20,
+    color: "#0f172a",
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: "500",
   },
   historyAttribution: {
-    color: "#8ea1df",
-    fontSize: 11,
-    lineHeight: 16,
+    color: "#475569",
+    fontSize: 12,
+    lineHeight: 17,
     marginBottom: 4,
   },
   historySectionLabel: {
-    color: "#aebfff",
+    color: "#047857",
     fontSize: 10,
-    fontWeight: "700",
+    fontWeight: "800",
     letterSpacing: 0.6,
     textTransform: "uppercase",
     marginTop: 6,
     marginBottom: 4,
   },
   historyVoiceMatchDetail: {
-    color: "#e2eaff",
+    color: "#0f172a",
     fontSize: 11,
     lineHeight: 17,
     marginBottom: 4,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
-    backgroundColor: "#0f1628",
+    backgroundColor: "#ecfdf5",
     borderRadius: 8,
     padding: 10,
     borderWidth: 1,
-    borderColor: "#2a5080",
+    borderColor: "rgba(15, 118, 110, 0.35)",
   },
   historyLogicalFlow: {
-    color: "#c5d5ff",
+    color: "#1e293b",
     fontSize: 11,
     lineHeight: 17,
     marginTop: 8,
     marginBottom: 6,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
-    backgroundColor: "#12182e",
+    backgroundColor: "#fffbeb",
     borderRadius: 8,
     padding: 10,
     borderWidth: 1,
-    borderColor: "#2c3a6e",
+    borderColor: "rgba(180, 83, 9, 0.35)",
   },
   historyDiagnostics: {
-    color: "#b8ccff",
+    color: "#1e293b",
     fontSize: 10,
-    lineHeight: 14,
+    lineHeight: 15,
     marginTop: 6,
     marginBottom: 8,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
-    backgroundColor: "#0a0f22",
+    backgroundColor: "#f1f5f9",
     borderRadius: 8,
     padding: 8,
     borderWidth: 1,
-    borderColor: "#202c55",
+    borderColor: "#cbd5e1",
   },
   deleteLogButton: {
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#7b3f53",
-    backgroundColor: "#2b1520",
+    borderColor: "#fecaca",
+    backgroundColor: "#fef2f2",
     paddingHorizontal: 10,
     paddingVertical: 4,
   },
   deleteLogButtonText: {
-    color: "#ff9bae",
+    color: "#b91c1c",
     fontSize: 11,
     fontWeight: "700",
   },
   historyEmptyText: {
-    color: "#9ba8d8",
+    color: "#334155",
     fontSize: 14,
+    lineHeight: 20,
+    fontWeight: "500",
   },
   speakerListPanel: {
     marginTop: 14,
-    borderRadius: 14,
-    backgroundColor: "#0f152b",
+    borderRadius: 18,
+    backgroundColor: "#eef6f4",
     borderWidth: 1,
-    borderColor: "#202c55",
+    borderColor: "rgba(15, 118, 110, 0.28)",
     paddingBottom: 12,
   },
   speakerListHelp: {
-    color: "#8b98c9",
+    color: "#475569",
     fontSize: 11,
     lineHeight: 16,
     marginHorizontal: 14,
@@ -2710,13 +2808,18 @@ const styles = StyleSheet.create({
   speakerListRow: {
     marginHorizontal: 10,
     marginTop: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    borderRadius: 12,
-    backgroundColor: "#131c39",
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: "#ffffff",
     borderWidth: 1,
-    borderColor: "#253264",
+    borderColor: "rgba(15, 118, 110, 0.32)",
     gap: 10,
+    shadowColor: "#0f172a",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 3,
+    elevation: 2,
   },
   speakerListHeaderRow: {
     flexDirection: "row",
@@ -2733,34 +2836,34 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   speakerListName: {
-    color: "#e8edff",
+    color: "#1e293b",
     fontSize: 13,
     fontWeight: "600",
   },
   speakerListHint: {
-    color: "#9aaad8",
+    color: "#475569",
     fontSize: 12,
     marginTop: 4,
     lineHeight: 17,
   },
   speakerListHintPlaceholder: {
-    color: "#6b769e",
+    color: "#64748b",
     fontSize: 12,
     marginTop: 4,
     fontStyle: "italic",
   },
   speakerListEdit: {
-    color: "#8ea1ff",
+    color: "#047857",
     fontSize: 12,
     fontWeight: "700",
   },
   speakerListActionDisabled: {
-    color: "#5f6b93",
+    color: "#94a3b8",
   },
   sampleList: {
     marginTop: 10,
     borderTopWidth: 1,
-    borderTopColor: "#253264",
+    borderTopColor: "rgba(15, 118, 110, 0.22)",
     paddingTop: 8,
     gap: 8,
   },
@@ -2768,41 +2871,41 @@ const styles = StyleSheet.create({
     marginBottom: 4,
     paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: "#253264",
+    borderBottomColor: "rgba(15, 118, 110, 0.22)",
   },
   profileVectorsHeading: {
-    color: "#e8ecff",
+    color: "#0f172a",
     fontSize: 12,
-    fontWeight: "700",
+    fontWeight: "800",
   },
   profileVectorsHint: {
-    color: "#7580ab",
+    color: "#475569",
     fontSize: 10,
     marginTop: 4,
     marginBottom: 6,
     lineHeight: 14,
   },
   recentVectorsLabel: {
-    color: "#8ea1df",
+    color: "#134e4a",
     fontSize: 11,
-    fontWeight: "600",
+    fontWeight: "700",
     marginTop: 10,
   },
   vectorBlock: {
     marginTop: 8,
   },
   vectorBlockTitle: {
-    color: "#8ea1ff",
+    color: "#0d9488",
     fontSize: 11,
     fontWeight: "600",
   },
   vectorBlockSubtitle: {
-    color: "#c9a227",
+    color: "#b45309",
     fontSize: 10,
     marginTop: 2,
   },
   vectorBlockEmpty: {
-    color: "#5c6a8e",
+    color: "#94a3b8",
     fontSize: 10,
     fontStyle: "italic",
     marginTop: 4,
@@ -2811,7 +2914,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   vectorMono: {
-    color: "#dce4ff",
+    color: "#0f172a",
     fontSize: 9,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
     lineHeight: 13,
@@ -2827,25 +2930,25 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   sampleTitle: {
-    color: "#d5deff",
+    color: "#0f172a",
     fontSize: 12,
     fontWeight: "600",
   },
   sampleMeta: {
-    color: "#8393c8",
+    color: "#475569",
     fontSize: 11,
     marginTop: 2,
   },
   sampleDeleteButton: {
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#7b3f53",
-    backgroundColor: "#2b1520",
+    borderColor: "#fecaca",
+    backgroundColor: "#fef2f2",
     paddingHorizontal: 9,
     paddingVertical: 5,
   },
   sampleDeleteText: {
-    color: "#ff9bae",
+    color: "#b91c1c",
     fontSize: 11,
     fontWeight: "700",
   },
@@ -2853,26 +2956,32 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: "center",
     paddingHorizontal: 20,
-    backgroundColor: "rgba(6, 8, 18, 0.72)",
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
   },
   modalCard: {
-    borderRadius: 18,
-    backgroundColor: "#1a2344",
+    borderRadius: 22,
+    backgroundColor: "#fffefb",
     borderWidth: 1,
-    borderColor: "#2c3b72",
-    padding: 18,
+    borderColor: "rgba(20, 184, 166, 0.35)",
+    padding: 20,
     zIndex: 1,
+    shadowColor: "#0d9488",
+    shadowOffset: { width: 0, height: 16 },
+    shadowOpacity: 0.2,
+    shadowRadius: 28,
+    elevation: 16,
   },
   modalTitle: {
-    color: "#f0f4ff",
-    fontSize: 17,
-    fontWeight: "700",
+    color: "#134e4a",
+    fontSize: 18,
+    fontWeight: "800",
+    letterSpacing: -0.3,
   },
   modalSubtitle: {
-    color: "#9aaad8",
+    color: "#64748b",
     fontSize: 12,
-    marginTop: 6,
-    lineHeight: 17,
+    marginTop: 8,
+    lineHeight: 18,
   },
   modalInputSingleLine: {
     minHeight: 48,
@@ -2886,18 +2995,18 @@ const styles = StyleSheet.create({
     marginTop: 14,
     minHeight: 100,
     maxHeight: Platform.OS === "web" ? 180 : 140,
-    borderRadius: 12,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#3c4d8d",
-    backgroundColor: "#101834",
-    color: "#f0f4ff",
-    paddingHorizontal: 12,
+    borderColor: "rgba(20, 184, 166, 0.35)",
+    backgroundColor: "rgba(255, 255, 255, 0.95)",
+    color: "#1e293b",
+    paddingHorizontal: 14,
     paddingVertical: 10,
     fontSize: 14,
     textAlignVertical: "top",
   },
   modalCharCount: {
-    color: "#6b769e",
+    color: "#64748b",
     fontSize: 11,
     marginTop: 6,
     textAlign: "right",
@@ -2909,7 +3018,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   clearHintButtonText: {
-    color: "#ff9bae",
+    color: "#dc2626",
     fontSize: 13,
     fontWeight: "600",
     textDecorationLine: "underline",
@@ -2930,16 +3039,18 @@ const styles = StyleSheet.create({
   },
   modalButtonSecondary: {
     borderWidth: 1,
-    borderColor: "#4e5fa9",
+    borderColor: "rgba(20, 184, 166, 0.55)",
     backgroundColor: "transparent",
   },
   modalButtonSecondaryText: {
-    color: "#c8d2ff",
+    color: "#0f766e",
     fontSize: 14,
-    fontWeight: "600",
+    fontWeight: "700",
   },
   modalButtonPrimary: {
-    backgroundColor: "#6a7cff",
+    backgroundColor: "#14b8a6",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.35)",
   },
   modalButtonPrimaryText: {
     color: "#ffffff",
