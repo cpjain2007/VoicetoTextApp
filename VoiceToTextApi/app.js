@@ -33,6 +33,15 @@ const speakerMatchRelaxedEnabled = ["true", "1", "yes"].includes(
 const speakerMatchMinGapBetweenProfiles = Number(process.env.SPEAKER_MATCH_MIN_GAP_BETWEEN_PROFILES || "0.025");
 const speakerMatchSecondStrongMin = Number(process.env.SPEAKER_MATCH_SECOND_STRONG_MIN || "0.84");
 const speakerMatchHighConfidenceOverride = Number(process.env.SPEAKER_MATCH_HIGH_CONFIDENCE_OVERRIDE || "0.995");
+const speakerEmbeddingServiceUrl = (process.env.SPEAKER_EMBEDDING_SERVICE_URL || "").trim().replace(/\/+$/, "");
+const speakerEmbeddingServiceToken = (process.env.SPEAKER_EMBEDDING_SERVICE_TOKEN || "").trim();
+const speakerEmbeddingMatchThreshold = Number(process.env.SPEAKER_EMBEDDING_MATCH_THRESHOLD || "0.55");
+const speakerEmbeddingMatchMargin = Number(process.env.SPEAKER_EMBEDDING_MATCH_MARGIN || "0.05");
+const speakerEmbeddingHighConfidenceOverride = Number(process.env.SPEAKER_EMBEDDING_HIGH_CONFIDENCE_OVERRIDE || "0.75");
+const speakerEmbeddingTimeoutMs = Math.min(
+  Math.max(Number(process.env.SPEAKER_EMBEDDING_TIMEOUT_MS || "18000") || 18000, 1000),
+  45000,
+);
 const maxUploadMb = Math.min(Math.max(Number(process.env.MAX_UPLOAD_MB || "25") || 25, 1), 100);
 const maxUploadBytes = maxUploadMb * 1024 * 1024;
 const assemblySpeakerIdentificationEnv = (process.env.ASSEMBLYAI_SPEAKER_IDENTIFICATION || "true")
@@ -173,6 +182,45 @@ const getAssemblyClient = () => {
 
 const transcribeWithRetry = (assemblyClient, payload) =>
   withRetries(() => assemblyClient.transcripts.transcribe(payload), { label: "AssemblyAI.transcribe" });
+
+const fetchSpeakerEmbedding = async (audioBuffer, mimeType) => {
+  if (!speakerEmbeddingServiceUrl) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), speakerEmbeddingTimeoutMs);
+  try {
+    const response = await withRetries(
+      () =>
+        fetch(`${speakerEmbeddingServiceUrl}/embed`, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            ...(speakerEmbeddingServiceToken ? { Authorization: `Bearer ${speakerEmbeddingServiceToken}` } : {}),
+          },
+          body: JSON.stringify({
+            audioBase64: audioBuffer.toString("base64"),
+            mimeType: mimeType || "audio/m4a",
+          }),
+        }),
+      { label: "SpeakerEmbedding.embed", maxAttempts: 1, baseDelayMs: 600 },
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(text || `Speaker embedding service failed (${response.status}).`);
+    }
+    const payload = JSON.parse(text);
+    const embedding = Array.isArray(payload?.embedding) ? payload.embedding.map(Number) : [];
+    if (embedding.length === 0 || embedding.some((value) => !Number.isFinite(value))) {
+      throw new Error("Speaker embedding service returned an invalid embedding.");
+    }
+    return embedding;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
 
 const buildAiInsights = async (text) => {
   if (!openaiApiKey || !text.trim()) {
@@ -378,7 +426,7 @@ const cleanEnrollmentSource = (value) => {
 
 const speakerNameKey = (value) => String(value || "").trim().toLowerCase();
 
-const buildEnrollmentSample = (speakerName, signature, metadata = {}) => {
+const buildEnrollmentSample = (speakerName, signature, metadata = {}, speakerEmbedding = null) => {
   const createdAtMs = Date.now();
   const historyClientId =
     typeof metadata.historyClientId === "string" ? metadata.historyClientId.trim().slice(0, 120) : "";
@@ -390,12 +438,26 @@ const buildEnrollmentSample = (speakerName, signature, metadata = {}) => {
     createdAtIso: new Date(createdAtMs).toISOString(),
     ...(historyClientId ? { historyClientId } : {}),
     vector: [...signature],
+    ...(Array.isArray(speakerEmbedding) && speakerEmbedding.length > 0 ? { embeddingVector: [...speakerEmbedding] } : {}),
   };
 };
 
-const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
+const averageVectors = (vectors) => {
+  const valid = vectors.filter((vector) => Array.isArray(vector) && vector.length > 0);
+  if (valid.length === 0) {
+    return null;
+  }
+  const dim = valid[0].length;
+  const aligned = valid.map((vector) => voiceRecognition.padVoiceVector(vector, dim, 0));
+  return Array.from({ length: dim }, (_, index) =>
+    aligned.reduce((sum, vector) => sum + vector[index], 0) / aligned.length,
+  );
+};
+
+const updateSpeakerProfile = async (speakerName, signature, metadata = {}, speakerEmbedding = null) => {
   const profiles = await readSpeakerProfilesMerged();
   const sigCopy = [...signature];
+  const embeddingCopy = Array.isArray(speakerEmbedding) && speakerEmbedding.length > 0 ? [...speakerEmbedding] : null;
   const displaySpeakerName = speakerName.trim();
   const existingIndex = profiles.findIndex((item) => speakerNameKey(item.name) === speakerNameKey(displaySpeakerName));
   let savedSpeakerName = displaySpeakerName;
@@ -403,7 +465,7 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
     const current = profiles[existingIndex];
     const storedSpeakerName = typeof current.name === "string" && current.name.trim() ? current.name.trim() : displaySpeakerName;
     savedSpeakerName = storedSpeakerName;
-    const enrollmentSample = buildEnrollmentSample(storedSpeakerName, sigCopy, metadata);
+    const enrollmentSample = buildEnrollmentSample(storedSpeakerName, sigCopy, metadata, embeddingCopy);
     const total = (current.samples || 0) + 1;
     const currentVector =
       Array.isArray(current.vector) && current.vector.length > 0 ? current.vector : signature.map(() => 0);
@@ -415,6 +477,11 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
     const enrollmentSamples = Array.isArray(current.enrollmentSamples)
       ? [...current.enrollmentSamples, enrollmentSample]
       : [enrollmentSample];
+    const embeddingVectors = enrollmentSamples
+      .map((sample) => sample?.embeddingVector)
+      .filter((vector) => Array.isArray(vector) && vector.length > 0);
+    const embeddingVector = averageVectors(embeddingVectors);
+    const embeddingRecent = embeddingVectors.slice(-speakerRecentVectorsMax);
     profiles[existingIndex] = {
       ...current,
       name: storedSpeakerName,
@@ -422,33 +489,104 @@ const updateSpeakerProfile = async (speakerName, signature, metadata = {}) => {
       vector: alignedCurrent.map((value, index) => (value * (total - 1) + signature[index]) / total),
       vectorsRecent: nextRecent,
       enrollmentSamples,
+      ...(embeddingVector ? { embeddingVector, embeddingRecent } : {}),
     };
   } else {
-    const enrollmentSample = buildEnrollmentSample(displaySpeakerName, sigCopy, metadata);
+    const enrollmentSample = buildEnrollmentSample(displaySpeakerName, sigCopy, metadata, embeddingCopy);
     profiles.push({
       name: displaySpeakerName,
       samples: 1,
       vector: signature,
       vectorsRecent: [sigCopy],
       enrollmentSamples: [enrollmentSample],
+      ...(embeddingCopy ? { embeddingVector: embeddingCopy, embeddingRecent: [embeddingCopy] } : {}),
     });
   }
   await speakerStore.writeSpeakerProfiles(profiles);
   return savedSpeakerName;
 };
 
+/** Max embedding floats returned per vector in GET /speakers (full ECAPA ~192). */
+const publicSpeakerEmbeddingMaxLength = Math.min(
+  Math.max(Number(process.env.PUBLIC_SPEAKER_EMBEDDING_MAX_LENGTH || "1024") || 1024, 32),
+  2048,
+);
+
+const roundNumericArray = (value, decimals, maxLength) => {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { numbers: null, sourceLength: 0, truncated: false };
+  }
+  const sourceLength = value.length;
+  const capped = typeof maxLength === "number" && maxLength > 0 ? value.slice(0, maxLength) : value;
+  const numbers = capped.map((item) => {
+    const n = Number(item);
+    if (!Number.isFinite(n)) {
+      return 0;
+    }
+    return Number(n.toFixed(decimals));
+  });
+  return { numbers, sourceLength, truncated: sourceLength > numbers.length };
+};
+
 const publicEnrollmentSamples = (profile) =>
   Array.isArray(profile?.enrollmentSamples)
     ? profile.enrollmentSamples
         .filter((sample) => sample && typeof sample === "object" && typeof sample.sampleId === "string")
-        .map((sample) => ({
-          sampleId: sample.sampleId,
-          source: typeof sample.source === "string" ? sample.source : "unknown",
-          createdAtMs: typeof sample.createdAtMs === "number" ? sample.createdAtMs : null,
-          createdAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
-          historyClientId: typeof sample.historyClientId === "string" ? sample.historyClientId : null,
-        }))
+        .map((sample) => {
+          const fp = roundNumericArray(sample.vector, 6, 32);
+          const emb = roundNumericArray(sample.embeddingVector, 6, publicSpeakerEmbeddingMaxLength);
+          return {
+            sampleId: sample.sampleId,
+            source: typeof sample.source === "string" ? sample.source : "unknown",
+            createdAtMs: typeof sample.createdAtMs === "number" ? sample.createdAtMs : null,
+            createdAtIso: typeof sample.createdAtIso === "string" ? sample.createdAtIso : null,
+            historyClientId: typeof sample.historyClientId === "string" ? sample.historyClientId : null,
+            hasFingerprint: Array.isArray(sample.vector) && sample.vector.length > 0,
+            hasEmbedding: Array.isArray(sample.embeddingVector) && sample.embeddingVector.length > 0,
+            voiceFingerprintDimensions: fp.sourceLength || null,
+            voiceFingerprint: fp.numbers,
+            voiceFingerprintTruncated: fp.truncated,
+            embeddingDimensions: emb.sourceLength || null,
+            embeddingVector: emb.numbers,
+            embeddingTruncated: emb.truncated,
+          };
+        })
     : [];
+
+const publicProfileVoiceRollups = (profile) => {
+  const aggFp = roundNumericArray(profile?.vector, 6, 32);
+  const recentFp = Array.isArray(profile?.vectorsRecent)
+    ? profile.vectorsRecent.map((v) => roundNumericArray(v, 6, 32)).filter((item) => item.numbers && item.numbers.length)
+    : [];
+  const aggEmb = roundNumericArray(profile?.embeddingVector, 6, publicSpeakerEmbeddingMaxLength);
+  const recentEmb = Array.isArray(profile?.embeddingRecent)
+    ? profile.embeddingRecent
+        .map((v) => roundNumericArray(v, 6, publicSpeakerEmbeddingMaxLength))
+        .filter((item) => item.numbers && item.numbers.length)
+    : [];
+  return {
+    profileVoiceFingerprint: aggFp.numbers,
+    profileVoiceFingerprintDimensions: aggFp.sourceLength || null,
+    profileVoiceFingerprintTruncated: aggFp.truncated,
+    profileVoiceFingerprintsRecent: recentFp.map((item) => ({
+      values: item.numbers,
+      dimensions: item.sourceLength,
+      truncated: item.truncated,
+    })),
+    profileSpeakerEmbedding: aggEmb.numbers
+      ? {
+          values: aggEmb.numbers,
+          dimensions: aggEmb.sourceLength,
+          truncated: aggEmb.truncated,
+        }
+      : null,
+    profileSpeakerEmbeddingsRecent: recentEmb.map((item) => ({
+      values: item.numbers,
+      dimensions: item.sourceLength,
+      truncated: item.truncated,
+    })),
+  };
+};
 
 const rebuildProfileFromEnrollmentSamples = (profile, enrollmentSamples) => {
   const validSamples = enrollmentSamples.filter((sample) => Array.isArray(sample?.vector) && sample.vector.length > 0);
@@ -460,13 +598,25 @@ const rebuildProfileFromEnrollmentSamples = (profile, enrollmentSamples) => {
   const vector = Array.from({ length: dim }, (_, index) =>
     vectors.reduce((sum, item) => sum + item[index], 0) / vectors.length,
   );
-  return {
+  const embeddingVectors = validSamples
+    .map((sample) => sample?.embeddingVector)
+    .filter((embedding) => Array.isArray(embedding) && embedding.length > 0);
+  const embeddingVector = averageVectors(embeddingVectors);
+  const rebuilt = {
     ...profile,
     samples: validSamples.length,
     vector,
     vectorsRecent: vectors.slice(-speakerRecentVectorsMax),
     enrollmentSamples: validSamples,
   };
+  if (embeddingVector) {
+    rebuilt.embeddingVector = embeddingVector;
+    rebuilt.embeddingRecent = embeddingVectors.slice(-speakerRecentVectorsMax);
+  } else {
+    delete rebuilt.embeddingVector;
+    delete rebuilt.embeddingRecent;
+  }
+  return rebuilt;
 };
 
 const mergeEnrollmentSamples = (a = [], b = []) => {
@@ -502,6 +652,25 @@ const mergeSpeakerProfilePair = (base, incoming) => {
   ]
     .filter((vector) => Array.isArray(vector) && vector.length > 0)
     .slice(-speakerRecentVectorsMax);
+  const embeddingVectors = enrollmentSamples
+    .map((sample) => sample?.embeddingVector)
+    .filter((embedding) => Array.isArray(embedding) && embedding.length > 0);
+  if (embeddingVectors.length === 0) {
+    if (Array.isArray(base.embeddingVector) && base.embeddingVector.length > 0) {
+      embeddingVectors.push(base.embeddingVector);
+    }
+    if (Array.isArray(incoming.embeddingVector) && incoming.embeddingVector.length > 0) {
+      embeddingVectors.push(incoming.embeddingVector);
+    }
+  }
+  const embeddingVector = averageVectors(embeddingVectors);
+  const embeddingRecent = [
+    ...(Array.isArray(base.embeddingRecent) ? base.embeddingRecent : []),
+    ...(Array.isArray(incoming.embeddingRecent) ? incoming.embeddingRecent : []),
+    ...embeddingVectors,
+  ]
+    .filter((embedding) => Array.isArray(embedding) && embedding.length > 0)
+    .slice(-speakerRecentVectorsMax);
   const speakerDescription =
     typeof base.speakerDescription === "string" && base.speakerDescription.trim()
       ? base.speakerDescription
@@ -528,6 +697,8 @@ const mergeSpeakerProfilePair = (base, incoming) => {
       : {}),
     ...(vectorsRecent.length > 0 ? { vectorsRecent } : {}),
     ...(enrollmentSamples.length > 0 ? { enrollmentSamples } : {}),
+    ...(embeddingVector ? { embeddingVector } : {}),
+    ...(embeddingRecent.length > 0 ? { embeddingRecent } : {}),
     ...(speakerDescription ? { speakerDescription } : {}),
     ...(description ? { description } : {}),
   };
@@ -597,6 +768,106 @@ const isAmbiguousSpeakerPair = (best, second) => {
   return best.score - second.score < speakerMatchMinGapBetweenProfiles;
 };
 
+const collectEmbeddingCandidates = (profile, dim) => {
+  const candidates = [];
+  const seen = new Set();
+  const add = (embedding, metadata = {}) => {
+    if (!Array.isArray(embedding) || embedding.length === 0) {
+      return;
+    }
+    const vector = voiceRecognition.padVoiceVector(embedding, dim, 0);
+    const key = vector.join(",");
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push({ vector, ...metadata });
+  };
+
+  if (Array.isArray(profile?.enrollmentSamples)) {
+    for (const sample of profile.enrollmentSamples) {
+      add(sample?.embeddingVector, {
+        sampleId: typeof sample?.sampleId === "string" ? sample.sampleId : null,
+        sampleSource: typeof sample?.source === "string" ? sample.source : null,
+        sampleCreatedAtIso: typeof sample?.createdAtIso === "string" ? sample.createdAtIso : null,
+      });
+    }
+  }
+  add(profile?.embeddingVector, { sampleSource: "embedding_profile" });
+  if (Array.isArray(profile?.embeddingRecent)) {
+    for (const embedding of profile.embeddingRecent) {
+      add(embedding, { sampleSource: "embedding_recent" });
+    }
+  }
+  return candidates;
+};
+
+const detectSpeakerNameByEmbedding = async (speakerEmbedding) => {
+  if (!Array.isArray(speakerEmbedding) || speakerEmbedding.length === 0) {
+    return null;
+  }
+  const profiles = await readSpeakerProfilesMerged();
+  const scored = [];
+  const dim = speakerEmbedding.length;
+  for (const profile of profiles) {
+    const candidates = collectEmbeddingCandidates(profile, dim);
+    for (const candidate of candidates) {
+      const score = voiceRecognition.cosineSimilarity(speakerEmbedding, candidate.vector);
+      if (!Number.isFinite(score)) {
+        continue;
+      }
+      const current = scored.find((item) => item.name === profile.name);
+      if (!current || score > current.score) {
+        const next = {
+          name: profile.name,
+          score,
+          sampleId: candidate.sampleId || null,
+          sampleSource: candidate.sampleSource || "embedding",
+          sampleCreatedAtIso: candidate.sampleCreatedAtIso || null,
+          recognitionEngine: "embedding",
+        };
+        if (current) {
+          Object.assign(current, next);
+        } else {
+          scored.push(next);
+        }
+      }
+    }
+  }
+  if (scored.length === 0) {
+    return null;
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  const second = scored[1];
+  console.log("Speaker embedding candidates", {
+    best: best
+      ? {
+          name: best.name,
+          score: Number(best.score.toFixed(4)),
+          sampleId: best.sampleId,
+          sampleSource: best.sampleSource,
+        }
+      : null,
+    second: second
+      ? {
+          name: second.name,
+          score: Number(second.score.toFixed(4)),
+          sampleId: second.sampleId,
+          sampleSource: second.sampleSource,
+        }
+      : null,
+    threshold: speakerEmbeddingMatchThreshold,
+    margin: speakerEmbeddingMatchMargin,
+    highConfidenceOverride: speakerEmbeddingHighConfidenceOverride,
+  });
+  if (second && best.score < speakerEmbeddingHighConfidenceOverride && best.score - second.score < speakerEmbeddingMatchMargin) {
+    return null;
+  }
+  return best.score >= speakerEmbeddingMatchThreshold ? best : null;
+};
+
 const detectSpeakerName = async (signature) => {
   const profiles = await readSpeakerProfilesMerged();
   if (profiles.length === 0) {
@@ -614,6 +885,7 @@ const detectSpeakerName = async (signature) => {
       sampleId: match.sampleId,
       sampleSource: match.sampleSource,
       sampleCreatedAtIso: match.sampleCreatedAtIso,
+      recognitionEngine: "fingerprint",
     });
   }
   if (scored.length === 0) {
@@ -623,8 +895,22 @@ const detectSpeakerName = async (signature) => {
   const best = scored[0];
   const second = scored[1];
   console.log("Speaker match candidates", {
-    best: best ? { name: best.name, score: Number(best.score.toFixed(4)), sampleSource: best.sampleSource } : null,
-    second: second ? { name: second.name, score: Number(second.score.toFixed(4)) } : null,
+    best: best
+      ? {
+          name: best.name,
+          score: Number(best.score.toFixed(4)),
+          sampleId: best.sampleId,
+          sampleSource: best.sampleSource,
+        }
+      : null,
+    second: second
+      ? {
+          name: second.name,
+          score: Number(second.score.toFixed(4)),
+          sampleId: second.sampleId,
+          sampleSource: second.sampleSource,
+        }
+      : null,
     threshold: speakerSimilarityThreshold,
     relaxedEnabled: speakerMatchRelaxedEnabled,
     relaxedThreshold: getSpeakerMatchRelaxedThreshold(),
@@ -665,6 +951,7 @@ app.get("/speakers", async (_req, res) => {
         return {
           name: profile.name,
           samples: profile.samples || 0,
+          ...publicProfileVoiceRollups(profile),
           enrollmentSamples: publicEnrollmentSamples(profile),
           ...(desc.trim() ? { description: desc.trim() } : {}),
         };
@@ -819,6 +1106,14 @@ app.post("/history", async (req, res) => {
 });
 
 const executeTranscription = async (req, res, fileLike) => {
+  const startedAtMs = Date.now();
+  let lastTimingMs = startedAtMs;
+  const timings = [];
+  const recordTiming = (step) => {
+    const now = Date.now();
+    timings.push({ step, ms: now - lastTimingMs });
+    lastTimingMs = now;
+  };
   try {
     if (!assemblyApiKey) {
       return res.status(500).json({ error: "ASSEMBLYAI_API_KEY is not configured." });
@@ -842,6 +1137,20 @@ const executeTranscription = async (req, res, fileLike) => {
     const extension = extensionFromMime(fileLike.mimetype);
     const pcmBuffer = await convertAudioToPcm(fileLike.buffer, extension);
     const voiceSignature = voiceRecognition.buildVoiceSignature(pcmBuffer);
+    recordTiming("audio_fingerprint");
+    let speakerEmbedding = null;
+    let embeddingFetchError = null;
+    if (speakerEmbeddingServiceUrl) {
+      try {
+        speakerEmbedding = await fetchSpeakerEmbedding(fileLike.buffer, fileLike.mimetype);
+      } catch (err) {
+        embeddingFetchError = err instanceof Error ? err.message : String(err);
+        console.warn("Speaker embedding unavailable; falling back to fingerprint matching", {
+          message: embeddingFetchError,
+        });
+      }
+    }
+    recordTiming("speaker_embedding");
     const speakerNameHeader =
       typeof req.headers["x-speaker-name"] === "string" ? req.headers["x-speaker-name"].trim() : "";
     const speakerNameQuery =
@@ -851,12 +1160,21 @@ const executeTranscription = async (req, res, fileLike) => {
     const manualSpeakerName = speakerNameQuery || speakerNameHeader || manualSpeakerNameFromBody;
     let enrolledSpeakerName = null;
     if (manualSpeakerName) {
-      enrolledSpeakerName = await updateSpeakerProfile(manualSpeakerName, voiceSignature, {
-        source: req.body?.enrollmentSource || req.headers["x-enrollment-source"],
-        historyClientId: req.body?.historyClientId || req.headers["x-history-client-id"],
-      });
+      enrolledSpeakerName = await updateSpeakerProfile(
+        manualSpeakerName,
+        voiceSignature,
+        {
+          source: req.body?.enrollmentSource || req.headers["x-enrollment-source"],
+          historyClientId: req.body?.historyClientId || req.headers["x-history-client-id"],
+        },
+        speakerEmbedding,
+      );
     }
-    const detectedSpeaker = manualSpeakerName ? null : await detectSpeakerName(voiceSignature);
+    const detectedSpeaker = manualSpeakerName
+      ? null
+      : (speakerEmbedding ? await detectSpeakerNameByEmbedding(speakerEmbedding) : null) ||
+        (await detectSpeakerName(voiceSignature));
+    recordTiming("speaker_matching");
 
     const profilesForIdentification = await readSpeakerProfilesMerged();
     const knownSpeakerValues = voiceRecognition.prioritizeSpeakerNameInKnownList(
@@ -884,6 +1202,7 @@ const executeTranscription = async (req, res, fileLike) => {
         knownSpeakerValues,
         speakerIdentificationEnabled,
       );
+    recordTiming("speaker_identification_prep");
 
     const baseTranscriptOptions = {
       audio: fileLike.buffer,
@@ -971,6 +1290,7 @@ const executeTranscription = async (req, res, fileLike) => {
     if (transcript.status === "error") {
       throw new Error(transcript.error || "AssemblyAI transcription failed.");
     }
+    recordTiming("assembly_transcription");
 
     const transcriptText = transcript.text || "";
     const utterances = Array.isArray(transcript.utterances) ? transcript.utterances : [];
@@ -979,6 +1299,45 @@ const executeTranscription = async (req, res, fileLike) => {
 
     const speakerIdentificationCandidates =
       assemblySpeakers.length > 0 ? assemblySpeakers.map((s) => s.name) : knownSpeakerValues;
+    recordTiming("response_preparation");
+    console.log("Transcription timing", {
+      totalMs: Date.now() - startedAtMs,
+      steps: timings,
+      embeddingTimeoutMs: speakerEmbeddingTimeoutMs,
+      speakerEmbeddingEnabled: !!speakerEmbeddingServiceUrl,
+      speakerEmbeddingAvailable: !!speakerEmbedding,
+      recognitionEngine: detectedSpeaker?.recognitionEngine || "fingerprint",
+    });
+
+    const recognitionAttempted = !manualSpeakerName;
+    const speakerRecognitionEngineForDiagnostics = manualSpeakerName
+      ? null
+      : detectedSpeaker
+        ? detectedSpeaker.recognitionEngine
+        : "none";
+    const speakerMatchUsedEmbedding =
+      recognitionAttempted && detectedSpeaker?.recognitionEngine === "embedding";
+    const speakerMatchUsedFingerprint =
+      recognitionAttempted && detectedSpeaker?.recognitionEngine === "fingerprint";
+    const transcriptionDiagnostics = {
+      embeddingServiceConfigured: !!speakerEmbeddingServiceUrl,
+      embeddingFetchAttempted: !!speakerEmbeddingServiceUrl,
+      embeddingFetchSucceeded: !!speakerEmbedding,
+      embeddingDimensions: Array.isArray(speakerEmbedding) ? speakerEmbedding.length : null,
+      embeddingError: embeddingFetchError
+        ? String(embeddingFetchError).replace(/\s+/g, " ").trim().slice(0, 320)
+        : null,
+      embeddingTimeoutMs: speakerEmbeddingTimeoutMs,
+      speakerRecognitionEngine: speakerRecognitionEngineForDiagnostics,
+      speakerMatchUsedEmbedding,
+      speakerMatchUsedFingerprint,
+      recognitionAttempted,
+      profileEnrollmentAttempted: !!manualSpeakerName,
+      fingerprintVectorSavedToProfile: !!manualSpeakerName,
+      embeddingVectorSavedToProfile: !!(manualSpeakerName && speakerEmbedding),
+      timingTotalMs: Date.now() - startedAtMs,
+      timingSteps: timings.map((item) => ({ step: item.step, ms: item.ms })),
+    };
 
     return res.json({
       text: transcriptText,
@@ -988,9 +1347,13 @@ const executeTranscription = async (req, res, fileLike) => {
       detectedSpeakerSampleId: detectedSpeaker?.sampleId || null,
       detectedSpeakerSampleSource: detectedSpeaker?.sampleSource || null,
       detectedSpeakerSampleCreatedAtIso: detectedSpeaker?.sampleCreatedAtIso || null,
+      speakerRecognitionEngine: manualSpeakerName ? null : detectedSpeaker?.recognitionEngine || "none",
+      speakerEmbeddingEnabled: !!speakerEmbeddingServiceUrl,
+      speakerEmbeddingAvailable: !!speakerEmbedding,
       assemblySpeakerLabel: dominantAssemblySpeakerLabel,
       speakerIdentificationCandidates,
       speakerIdentificationMapping,
+      transcriptionDiagnostics,
       utterances: utterances.map((item) => ({
         speaker: item.speaker || null,
         text: item.text || "",
@@ -999,6 +1362,10 @@ const executeTranscription = async (req, res, fileLike) => {
       })),
     });
   } catch (error) {
+    console.warn("Transcription failed timing", {
+      totalMs: Date.now() - startedAtMs,
+      steps: timings,
+    });
     const message =
       error && typeof error === "object" && "message" in error
         ? error.message

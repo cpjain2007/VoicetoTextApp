@@ -1,4 +1,5 @@
 import { StatusBar } from "expo-status-bar";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Audio } from "expo-av";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -16,6 +17,28 @@ import {
   TextInput,
   View,
 } from "react-native";
+
+type TranscriptionDiagnosticsPayload = {
+  embeddingServiceConfigured: boolean;
+  embeddingFetchAttempted: boolean;
+  embeddingFetchSucceeded: boolean;
+  embeddingDimensions: number | null;
+  embeddingError: string | null;
+  embeddingTimeoutMs: number | null;
+  speakerRecognitionEngine: "embedding" | "fingerprint" | "none" | null;
+  speakerMatchUsedEmbedding: boolean | null;
+  speakerMatchUsedFingerprint: boolean | null;
+  recognitionAttempted: boolean;
+  profileEnrollmentAttempted: boolean;
+  fingerprintVectorSavedToProfile: boolean;
+  embeddingVectorSavedToProfile: boolean;
+  timingTotalMs: number | null;
+  timingSteps: Array<{ step: string; ms: number }>;
+};
+
+type TranscriptionDiagnosticsPhase = TranscriptionDiagnosticsPayload & {
+  phase: "transcribe" | "enrollment";
+};
 
 type TranscriptLogItem = {
   id: string;
@@ -38,6 +61,15 @@ type TranscriptLogItem = {
   wasVoiceMatchUsed?: boolean;
   wasConflictPromptShown?: boolean;
   wasVoiceProfileEnrolled?: boolean;
+  /**
+   * First transcribe API response `speakerRecognitionEngine`: which matcher picked the enrolled speaker (if any).
+   * Persisted for history clarity; also derivable from transcriptionDiagnosticsInitial when missing.
+   */
+  firstPassRecognitionEngine?: "embedding" | "fingerprint" | "none";
+  /** Server-side diagnostics for the first /transcribe-base64 call (no manual name). */
+  transcriptionDiagnosticsInitial?: TranscriptionDiagnosticsPhase | null;
+  /** Present when unknown-speaker flow re-uploaded audio with a name (enrollment). */
+  transcriptionDiagnosticsEnrollment?: TranscriptionDiagnosticsPhase | null;
 };
 
 type TranscriptionResult = {
@@ -49,6 +81,16 @@ type TranscriptionResult = {
   detectedSpeakerSampleSource: string | null;
   detectedSpeakerSampleCreatedAtIso: string | null;
   assemblySpeakerLabel: string | null;
+  speakerRecognitionEngine?: string | null;
+  speakerEmbeddingEnabled?: boolean;
+  speakerEmbeddingAvailable?: boolean;
+  transcriptionDiagnostics?: TranscriptionDiagnosticsPayload | null;
+};
+
+type NumericVectorPayload = {
+  values: number[];
+  dimensions?: number | null;
+  truncated?: boolean;
 };
 
 type SpeakerProfile = {
@@ -57,6 +99,13 @@ type SpeakerProfile = {
   /** Optional hint for AssemblyAI Speaker Identification (`speakerDescription` in API store). */
   description?: string;
   enrollmentSamples?: EnrollmentSample[];
+  /** Rollup 12-D fingerprint averaged across enrollments (API). */
+  profileVoiceFingerprint?: number[] | null;
+  profileVoiceFingerprintDimensions?: number | null;
+  profileVoiceFingerprintTruncated?: boolean;
+  profileVoiceFingerprintsRecent?: NumericVectorPayload[];
+  profileSpeakerEmbedding?: NumericVectorPayload | null;
+  profileSpeakerEmbeddingsRecent?: NumericVectorPayload[];
 };
 
 type EnrollmentSample = {
@@ -65,6 +114,14 @@ type EnrollmentSample = {
   createdAtMs?: number | null;
   createdAtIso?: string | null;
   historyClientId?: string | null;
+  hasFingerprint?: boolean;
+  hasEmbedding?: boolean;
+  voiceFingerprint?: number[] | null;
+  voiceFingerprintDimensions?: number | null;
+  voiceFingerprintTruncated?: boolean;
+  embeddingVector?: number[] | null;
+  embeddingDimensions?: number | null;
+  embeddingTruncated?: boolean;
 };
 
 type SpeakerCorrectionSuggestion = {
@@ -136,6 +193,41 @@ const formatSampleTime = (sample: EnrollmentSample) => {
   });
 };
 
+const formatVectorCsv = (values?: number[] | null) =>
+  Array.isArray(values) && values.length > 0 ? values.map((n) => String(n)).join(", ") : "";
+
+const VectorBlock = ({
+  title,
+  subtitle,
+  csv,
+  emptyLabel,
+  scrollMaxHeight = 132,
+}: {
+  title: string;
+  subtitle?: string;
+  csv: string;
+  emptyLabel: string;
+  scrollMaxHeight?: number;
+}) => (
+  <View style={styles.vectorBlock}>
+    <Text style={styles.vectorBlockTitle}>{title}</Text>
+    {subtitle ? <Text style={styles.vectorBlockSubtitle}>{subtitle}</Text> : null}
+    {csv ? (
+      <ScrollView
+        style={[styles.vectorScroll, { maxHeight: scrollMaxHeight }]}
+        nestedScrollEnabled
+        keyboardShouldPersistTaps="handled"
+      >
+        <Text style={styles.vectorMono} selectable>
+          {csv}
+        </Text>
+      </ScrollView>
+    ) : (
+      <Text style={styles.vectorBlockEmpty}>{emptyLabel}</Text>
+    )}
+  </View>
+);
+
 const formatHistoryDateGroup = (timestampMs: number) => {
   if (!Number.isFinite(timestampMs)) {
     return "Unknown date";
@@ -146,6 +238,366 @@ const formatHistoryDateGroup = (timestampMs: number) => {
     day: "2-digit",
     year: "numeric",
   });
+};
+
+const readRecognitionEngine = (
+  value: unknown,
+): TranscriptionDiagnosticsPayload["speakerRecognitionEngine"] => {
+  if (value === "embedding" || value === "fingerprint" || value === "none") {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return null;
+};
+
+const parseTranscriptionDiagnostics = (raw: unknown): TranscriptionDiagnosticsPayload | null => {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const o = raw as Record<string, unknown>;
+  const stepsRaw = o.timingSteps;
+  const timingSteps = Array.isArray(stepsRaw)
+    ? stepsRaw.slice(0, 30).map((s) => {
+        if (!s || typeof s !== "object") {
+          return { step: "", ms: 0 };
+        }
+        const st = s as Record<string, unknown>;
+        return {
+          step: typeof st.step === "string" ? st.step : "",
+          ms: typeof st.ms === "number" && Number.isFinite(st.ms) ? st.ms : 0,
+        };
+      })
+    : [];
+  return {
+    embeddingServiceConfigured: o.embeddingServiceConfigured === true,
+    embeddingFetchAttempted: o.embeddingFetchAttempted === true,
+    embeddingFetchSucceeded: o.embeddingFetchSucceeded === true,
+    embeddingDimensions:
+      typeof o.embeddingDimensions === "number" && Number.isFinite(o.embeddingDimensions)
+        ? o.embeddingDimensions
+        : null,
+    embeddingError:
+      typeof o.embeddingError === "string" && o.embeddingError.trim()
+        ? o.embeddingError.trim().slice(0, 400)
+        : null,
+    embeddingTimeoutMs:
+      typeof o.embeddingTimeoutMs === "number" && Number.isFinite(o.embeddingTimeoutMs)
+        ? o.embeddingTimeoutMs
+        : null,
+    speakerRecognitionEngine: readRecognitionEngine(o.speakerRecognitionEngine),
+    speakerMatchUsedEmbedding:
+      o.speakerMatchUsedEmbedding === true ? true : o.speakerMatchUsedEmbedding === false ? false : null,
+    speakerMatchUsedFingerprint:
+      o.speakerMatchUsedFingerprint === true ? true : o.speakerMatchUsedFingerprint === false ? false : null,
+    recognitionAttempted: o.recognitionAttempted === true,
+    profileEnrollmentAttempted: o.profileEnrollmentAttempted === true,
+    fingerprintVectorSavedToProfile: o.fingerprintVectorSavedToProfile === true,
+    embeddingVectorSavedToProfile: o.embeddingVectorSavedToProfile === true,
+    timingTotalMs:
+      typeof o.timingTotalMs === "number" && Number.isFinite(o.timingTotalMs) ? o.timingTotalMs : null,
+    timingSteps,
+  };
+};
+
+const readDiagnosticsPhase = (raw: unknown): TranscriptionDiagnosticsPhase | undefined => {
+  const base = parseTranscriptionDiagnostics(raw);
+  if (!base) {
+    return undefined;
+  }
+  const phase =
+    raw && typeof raw === "object" && (raw as Record<string, unknown>).phase === "enrollment"
+      ? "enrollment"
+      : "transcribe";
+  return { ...base, phase };
+};
+
+const formatHistoryDiagnosticsText = (item: TranscriptLogItem) => {
+  const formatOne = (title: string, d: TranscriptionDiagnosticsPhase) => {
+    const emb = !d.embeddingFetchAttempted
+      ? "not attempted (service off)"
+      : d.embeddingFetchSucceeded
+        ? `ok (${d.embeddingDimensions ?? "?"} dims)`
+        : d.embeddingError
+          ? `failed: ${d.embeddingError}`
+          : "failed";
+    const engine =
+      d.profileEnrollmentAttempted && !d.recognitionAttempted
+        ? "skipped (enrollment only)"
+        : d.speakerRecognitionEngine ?? "—";
+    const steps =
+      d.timingSteps.length > 0 ? d.timingSteps.map((s) => `${s.step} ${s.ms}ms`).join(", ") : "—";
+    return [
+      title,
+      `  Embedding service configured: ${d.embeddingServiceConfigured ? "yes" : "no"}`,
+      `  Embedding client timeout: ${d.embeddingTimeoutMs ?? "—"} ms`,
+      `  Embedding fetch: ${emb}`,
+      `  Recognition attempted: ${d.recognitionAttempted ? "yes" : "no"}`,
+      `  Match engine: ${engine}`,
+      `  Used embedding for match: ${d.speakerMatchUsedEmbedding === true ? "yes" : d.speakerMatchUsedEmbedding === false ? "no" : "—"}`,
+      `  Used fingerprint for match: ${d.speakerMatchUsedFingerprint === true ? "yes" : d.speakerMatchUsedFingerprint === false ? "no" : "—"}`,
+      `  Saved 12-D fingerprint to profile: ${d.fingerprintVectorSavedToProfile ? "yes" : "no"}`,
+      `  Saved embedding vector to profile: ${d.embeddingVectorSavedToProfile ? "yes" : "no"}`,
+      `  Server total time: ${d.timingTotalMs ?? "—"} ms`,
+      `  Steps: ${steps}`,
+    ].join("\n");
+  };
+  const blocks: string[] = [];
+  if (item.transcriptionDiagnosticsInitial) {
+    blocks.push(formatOne("Pass 1 — listen / detect", item.transcriptionDiagnosticsInitial));
+  }
+  if (item.transcriptionDiagnosticsEnrollment) {
+    blocks.push(formatOne("Pass 2 — name + enroll", item.transcriptionDiagnosticsEnrollment));
+  }
+  return blocks.join("\n\n");
+};
+
+/** Maps `recordTiming(step)` keys from VoiceToTextApi `executeTranscription` to code-path descriptions. */
+const SERVER_TIMING_STEP_PATH: Record<string, string> = {
+  audio_fingerprint:
+    "app.js → convertAudioToPcm + voiceRecognition.buildVoiceSignature (12-D fingerprint from PCM)",
+  speaker_embedding:
+    "app.js → fetchSpeakerEmbedding (neural vector) when SPEAKER_EMBEDDING_SERVICE_URL is set; errors fall back to fingerprint matching",
+  speaker_matching:
+    "app.js → detectSpeakerNameByEmbedding if embedding present, else detectSpeakerName (fingerprint); skipped when a manual speaker name is supplied (enroll-only request)",
+  speaker_identification_prep:
+    "app.js → readSpeakerProfilesMerged + build AssemblyAI speaker hints (speech_understanding / known names)",
+  assembly_transcription:
+    "app.js → transcribeWithRetry (AssemblyAI with speaker_labels + language detection or forced language)",
+  response_preparation:
+    "app.js → dominant speaker label + utterances + transcriptionDiagnostics payload",
+};
+
+const explainServerRecognitionBranch = (d: TranscriptionDiagnosticsPhase): string[] => {
+  const lines: string[] = [];
+  if (d.profileEnrollmentAttempted && !d.recognitionAttempted) {
+    lines.push(
+      "Outcome: enrollment-only — manual speaker name was sent, so `executeTranscription` updated the profile and did not run speaker matching.",
+    );
+    if (d.fingerprintVectorSavedToProfile) {
+      lines.push("  └ Saved new 12-D fingerprint sample on the speaker profile.");
+    }
+    if (d.embeddingVectorSavedToProfile) {
+      lines.push("  └ Saved neural embedding on the profile (embedding fetch succeeded earlier).");
+    } else if (d.embeddingFetchAttempted && !d.embeddingFetchSucceeded) {
+      lines.push("  └ Embedding not stored (embedding fetch failed); fingerprint enrollment still applied.");
+    }
+    return lines;
+  }
+  if (!d.recognitionAttempted) {
+    lines.push("Outcome: recognition not attempted (unexpected state — check diagnostics).");
+    return lines;
+  }
+  if (d.speakerRecognitionEngine === "embedding") {
+    lines.push(
+      "Outcome: match via embedding — `detectSpeakerNameByEmbedding` scored enrolled profiles against this clip’s vector.",
+    );
+  } else if (d.speakerRecognitionEngine === "fingerprint") {
+    lines.push(
+      "Outcome: match via fingerprint — embedding unset or unused; `detectSpeakerName` compared 12-D signatures.",
+    );
+  } else if (d.speakerRecognitionEngine === "none" || d.speakerRecognitionEngine === null) {
+    lines.push(
+      "Outcome: no match — neither embedding nor fingerprint produced a confident enrolled speaker; UI may prompt for a name.",
+    );
+  } else {
+    lines.push(`Outcome: engine=${d.speakerRecognitionEngine ?? "—"}.`);
+  }
+  if (d.speakerMatchUsedEmbedding === true) {
+    lines.push("  └ Confirmed: embedding path contributed to the match decision.");
+  }
+  if (d.speakerMatchUsedFingerprint === true) {
+    lines.push("  └ Confirmed: fingerprint path contributed to the match decision.");
+  }
+  return lines;
+};
+
+const formatServerPassLogicalPath = (title: string, d: TranscriptionDiagnosticsPhase): string[] => {
+  const out: string[] = [`${title} (server: executeTranscription in app.js)`];
+  if (d.timingSteps.length > 0) {
+    d.timingSteps.forEach((s, i) => {
+      const path = SERVER_TIMING_STEP_PATH[s.step] || "(see API timing label)";
+      out.push(`  ${i + 1}. ${s.step} (+${s.ms} ms) — ${path}`);
+    });
+  } else {
+    out.push("  (No timing steps in payload — older server build or truncated response.)");
+  }
+  explainServerRecognitionBranch(d).forEach((line) => out.push(`  ${line}`));
+  return out;
+};
+
+/** Resolve which matcher decided pass-1 speaker (stored field wins, else diagnostics). */
+const resolvePass1RecognitionEngine = (
+  item: TranscriptLogItem,
+): "embedding" | "fingerprint" | "none" | undefined => {
+  const direct = item.firstPassRecognitionEngine;
+  if (direct === "embedding" || direct === "fingerprint" || direct === "none") {
+    return direct;
+  }
+  const e = item.transcriptionDiagnosticsInitial?.speakerRecognitionEngine;
+  if (e === "embedding" || e === "fingerprint" || e === "none") {
+    return e;
+  }
+  return undefined;
+};
+
+/** Precise embedding vs fingerprint breakdown for the History tab. */
+const formatHistoryVoiceMatchDetail = (item: TranscriptLogItem): string => {
+  const d1 = item.transcriptionDiagnosticsInitial;
+  const d2 = item.transcriptionDiagnosticsEnrollment;
+  const engine = resolvePass1RecognitionEngine(item);
+
+  const lines: string[] = [];
+
+  lines.push("Pass 1 — listen (request had no manual speaker name)");
+  if (engine === "embedding") {
+    lines.push(
+      "  • Enrolled speaker decided by: neural embedding match (clip vector vs stored ECAPA-style embeddings).",
+    );
+  } else if (engine === "fingerprint") {
+    lines.push(
+      "  • Enrolled speaker decided by: 12-D audio fingerprint match (PCM stats vs stored fingerprints).",
+    );
+  } else if (engine === "none") {
+    lines.push("  • Enrolled speaker decided by: no match — neither path exceeded the confidence threshold.");
+  } else {
+    lines.push("  • Enrolled speaker decided by: unknown (older entry or diagnostics missing).");
+  }
+
+  if (typeof item.speakerConfidence === "number" && Number.isFinite(item.speakerConfidence)) {
+    lines.push(
+      `  • Pass-1 match score (server): ${(item.speakerConfidence * 100).toFixed(1)}% (embedding vs fingerprint use different internal thresholds).`,
+    );
+  }
+
+  if (d1) {
+    const embOk = d1.embeddingFetchSucceeded === true;
+    const embTry = d1.embeddingFetchAttempted === true;
+    lines.push(
+      `  • Clip neural embedding computed: ${embOk ? `yes — ${d1.embeddingDimensions ?? "?"} dims` : embTry ? `no — ${d1.embeddingError?.trim() || "fetch failed"}` : "n/a (SPEAKER_EMBEDDING_SERVICE_URL not set)"}.`,
+    );
+    lines.push(
+      `  • Server match flags — used_embedding=${d1.speakerMatchUsedEmbedding === true ? "yes" : d1.speakerMatchUsedEmbedding === false ? "no" : "—"}, used_fingerprint=${d1.speakerMatchUsedFingerprint === true ? "yes" : d1.speakerMatchUsedFingerprint === false ? "no" : "—"}.`,
+    );
+    if (engine === "fingerprint" && embOk) {
+      lines.push(
+        "  • Interpretation: embedding ran but did not select the speaker; fingerprint matcher supplied the hit.",
+      );
+    }
+    if (engine === "fingerprint" && !embTry) {
+      lines.push("  • Interpretation: embedding service off — matching used fingerprints only.");
+    }
+    if (engine === "embedding" && d1.speakerMatchUsedFingerprint === true) {
+      lines.push(
+        "  • Note: fingerprint flag may also be true when both signals were evaluated; winning engine is embedding.",
+      );
+    }
+  } else {
+    lines.push("  • Pass-1 diagnostic payload not stored — only the summary line above may apply.");
+  }
+
+  if (d2) {
+    lines.push("Pass 2 — enroll (request included manual speaker name)");
+    lines.push(
+      `  • Speaker ID matching on this request: ${d2.recognitionAttempted ? "attempted" : "skipped"} (server enroll path when name is supplied).`,
+    );
+    lines.push(
+      `  • Saved to profile — 12-D fingerprint enrollment: ${d2.fingerprintVectorSavedToProfile ? "yes" : "no"}.`,
+    );
+    lines.push(
+      `  • Saved to profile — neural embedding enrollment: ${d2.embeddingVectorSavedToProfile ? "yes" : "no"}${d2.embeddingVectorSavedToProfile || !d2.embeddingFetchAttempted ? "" : " (clip had no usable embedding)"}.`,
+    );
+  }
+
+  return lines.join("\n");
+};
+
+const readFirstPassRecognitionEngineFromPayload = (item: Record<string, unknown>) => {
+  const v = item.firstPassRecognitionEngine;
+  if (v === "embedding" || v === "fingerprint" || v === "none") {
+    return v;
+  }
+  return undefined;
+};
+
+const firstPassEngineFromTranscriptionResult = (
+  r: TranscriptionResult,
+): TranscriptLogItem["firstPassRecognitionEngine"] | undefined => {
+  const v = r.speakerRecognitionEngine;
+  if (v === "embedding" || v === "fingerprint" || v === "none") {
+    return v;
+  }
+  if (v === null) {
+    return "none";
+  }
+  return undefined;
+};
+
+/** Narrative: app decisions (App.tsx) + server pipeline steps for each pass. */
+const formatHistoryLogicalFlow = (item: TranscriptLogItem): string => {
+  const lines: string[] = [];
+  lines.push("App (App.tsx)");
+  lines.push("  1. Stop recording → transcribeAudio(uri, \"\") — first POST /transcribe-base64 without manual speaker name.");
+  if (item.wasConflictPromptShown) {
+    lines.push(
+      "  2. Conflict — resolveSpeakerNameConflict: choose between a typed name and the server’s enrolled-speaker guess.",
+    );
+  }
+  if (item.wasUnknownSpeakerPromptShown) {
+    lines.push(
+      "  Unknown-speaker flow — openUnknownSpeakerNamePrompt: first pass still produced the “Unknown speaker” label.",
+    );
+    if (item.promptedSpeakerName) {
+      lines.push(
+        `  └ User named “${item.promptedSpeakerName}” → second transcribeAudio(..., name) for enrollment (same clip).`,
+      );
+    } else {
+      lines.push("  └ User skipped — no second POST; transcript kept as unknown without enrolling.");
+    }
+  } else if (item.wasVoiceMatchUsed) {
+    const eng = resolvePass1RecognitionEngine(item);
+    const detail =
+      eng === "embedding"
+        ? " — winner: neural embedding (speaker vector)"
+        : eng === "fingerprint"
+          ? " — winner: 12-D audio fingerprint"
+          : eng === "none"
+            ? ""
+            : "";
+    lines.push(
+      `  After pass 1 — enrolled speaker from voice matching${detail}; unknown-speaker modal was not needed.`,
+    );
+  } else {
+    lines.push(
+      "  After pass 1 — unknown-speaker modal not shown; final name comes from Source / attribution below (not a voice match to an enrollment).",
+    );
+  }
+  lines.push(
+    `  Final label: ${formatAttributionSource(item.speakerAttributionSource)} → “${item.speakerName}”.`,
+  );
+  if (item.assemblySpeakerLabel) {
+    lines.push(
+      `  AssemblyAI diarization speaker id (dominant): ${item.assemblySpeakerLabel} — utterance labels, separate from enrolled name.`,
+    );
+  }
+
+  if (item.transcriptionDiagnosticsInitial) {
+    lines.push("");
+    lines.push(...formatServerPassLogicalPath("Pass 1 — listen / match / transcribe", item.transcriptionDiagnosticsInitial));
+  }
+  if (item.transcriptionDiagnosticsEnrollment) {
+    lines.push("");
+    lines.push(...formatServerPassLogicalPath("Pass 2 — enroll named speaker", item.transcriptionDiagnosticsEnrollment));
+  }
+  if (!item.transcriptionDiagnosticsInitial && !item.transcriptionDiagnosticsEnrollment) {
+    lines.push("");
+    lines.push(
+      "(No transcriptionDiagnostics on this entry — only the app steps above; reconnect or re-record to capture server timing.)",
+    );
+  }
+
+  return lines.join("\n");
 };
 
 const readString = (item: Record<string, unknown>, key: string) =>
@@ -185,6 +637,14 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
   const id = clientId || rawId || `${createdAtMs}`;
   const cloudHistoryId = clientId && rawId && rawId !== clientId ? rawId : readString(item, "cloudHistoryId").trim();
 
+  const transcriptionDiagnosticsInitial = readDiagnosticsPhase(item.transcriptionDiagnosticsInitial);
+  const transcriptionDiagnosticsEnrollment = readDiagnosticsPhase(item.transcriptionDiagnosticsEnrollment);
+  const fromPayload = readFirstPassRecognitionEngineFromPayload(item);
+  const fromDiag = transcriptionDiagnosticsInitial?.speakerRecognitionEngine;
+  const firstPassRecognitionEngine =
+    fromPayload ??
+    (fromDiag === "embedding" || fromDiag === "fingerprint" || fromDiag === "none" ? fromDiag : undefined);
+
   return {
     id,
     speakerName: readString(item, "speakerName").trim() || UNKNOWN_SPEAKER_LABEL,
@@ -206,6 +666,9 @@ const normalizeHistoryItem = (value: unknown): TranscriptLogItem | null => {
     wasVoiceMatchUsed: readBoolean(item, "wasVoiceMatchUsed"),
     wasConflictPromptShown: readBoolean(item, "wasConflictPromptShown"),
     wasVoiceProfileEnrolled: readBoolean(item, "wasVoiceProfileEnrolled"),
+    ...(firstPassRecognitionEngine ? { firstPassRecognitionEngine } : {}),
+    transcriptionDiagnosticsInitial,
+    transcriptionDiagnosticsEnrollment,
   };
 };
 
@@ -278,7 +741,7 @@ export default function App() {
   const [speakerHintModal, setSpeakerHintModal] = useState<{ name: string; draft: string } | null>(null);
   const [isSavingSpeakerHint, setIsSavingSpeakerHint] = useState(false);
   const [hasLoadedHistory, setHasLoadedHistory] = useState(false);
-  const [statusText, setStatusText] = useState("Tap the mic and start speaking.");
+  const [statusText, setStatusText] = useState("Tap the mic — we’ll handle the rest.");
   const [errorText, setErrorText] = useState<string | null>(null);
   /** Should match API `SPEAKER_MATCH_THRESHOLD` (same default 0.97) so conflict prompts align with server gating. */
   const speakerAutoAssignMinConfidence = Number(process.env.EXPO_PUBLIC_SPEAKER_MIN_CONFIDENCE || "0.97");
@@ -287,6 +750,10 @@ export default function App() {
   const lastAutoExpandedHistoryIdRef = useRef<string | null>(null);
   const [unknownSpeakerModalVisible, setUnknownSpeakerModalVisible] = useState(false);
   const [unknownSpeakerDraft, setUnknownSpeakerDraft] = useState("");
+  const enrollTargetNameRef = useRef<string | null>(null);
+  const [enrollTargetName, setEnrollTargetName] = useState<string | null>(null);
+  const [enrollSpeakerModalVisible, setEnrollSpeakerModalVisible] = useState(false);
+  const [enrollNameDraft, setEnrollNameDraft] = useState("");
 
   const closeUnknownSpeakerPrompt = (value: string) => {
     setUnknownSpeakerModalVisible(false);
@@ -313,7 +780,8 @@ export default function App() {
 
   const canShowTranscript = useMemo(() => transcript.length > 0, [transcript]);
   const isRecording = recording !== null;
-  const isBusy = isRecording || isUploading || unknownSpeakerModalVisible;
+  const isBusy =
+    isRecording || isUploading || unknownSpeakerModalVisible || enrollSpeakerModalVisible;
 
   const createTimeLabel = (timestampMs: number) =>
     new Date(timestampMs).toLocaleTimeString(undefined, {
@@ -406,6 +874,10 @@ export default function App() {
       assemblySpeakerLabel?: string | null;
       speakerIdentificationCandidates?: string[];
       speakerIdentificationMapping?: Record<string, unknown> | null;
+      speakerRecognitionEngine?: string | null;
+      speakerEmbeddingEnabled?: boolean;
+      speakerEmbeddingAvailable?: boolean;
+      transcriptionDiagnostics?: unknown;
     };
     return {
       text: data.text?.trim() || data.transcript?.trim() || "",
@@ -429,6 +901,15 @@ export default function App() {
         typeof data.assemblySpeakerLabel === "string" && data.assemblySpeakerLabel.trim()
           ? data.assemblySpeakerLabel.trim()
           : null,
+      speakerRecognitionEngine:
+        typeof data.speakerRecognitionEngine === "string"
+          ? data.speakerRecognitionEngine
+          : data.speakerRecognitionEngine === null
+            ? null
+            : undefined,
+      speakerEmbeddingEnabled: data.speakerEmbeddingEnabled === true,
+      speakerEmbeddingAvailable: data.speakerEmbeddingAvailable === true,
+      transcriptionDiagnostics: parseTranscriptionDiagnostics(data.transcriptionDiagnostics),
     } satisfies TranscriptionResult;
   };
 
@@ -658,6 +1139,10 @@ export default function App() {
     ]);
   };
 
+  const clearTranscript = () => {
+    setTranscript("");
+  };
+
   const toggleHistoryItemExpanded = (historyId: string) => {
     setExpandedHistoryIds((current) =>
       current.includes(historyId)
@@ -771,7 +1256,7 @@ export default function App() {
     });
   }, [history, hasLoadedHistory]);
 
-  const handleRecordPress = async () => {
+  const handleRecordPress = async (opts?: { fromEnrollModal?: boolean }) => {
     if (isUploading) {
       return;
     }
@@ -790,11 +1275,117 @@ export default function App() {
           throw new Error("No recording file found.");
         }
 
+        const enrollName = enrollTargetNameRef.current;
+        enrollTargetNameRef.current = null;
+        setEnrollTargetName(null);
+
+        if (enrollName) {
+          const createdAtMs = Date.now();
+          const historyClientId = `${createdAtMs}`;
+          let transcriptionDiagnosticsEnrollment: TranscriptionDiagnosticsPhase | undefined;
+          let voiceEnrollmentRequestFailed = false;
+          let result: TranscriptionResult;
+          try {
+            result = await transcribeAudio(uri, enrollName, {
+              enrollmentSource: "speaker_name_input",
+              historyClientId,
+            });
+          } catch (enrollErr) {
+            voiceEnrollmentRequestFailed = true;
+            const enrollMessage =
+              enrollErr instanceof Error
+                ? enrollErr.message
+                : "Voice profile could not be saved on the server.";
+            setErrorText(enrollMessage);
+            setStatusText("Enrollment failed — try again.");
+            setIsUploading(false);
+            return;
+          }
+          if (result.transcriptionDiagnostics) {
+            transcriptionDiagnosticsEnrollment = readDiagnosticsPhase({
+              ...result.transcriptionDiagnostics,
+              phase: "enrollment",
+            });
+          }
+          const text = result.text;
+          let normalizedSpeakerName = result.enrolledSpeakerName || enrollName;
+          let speakerAttributionSource: SpeakerAttributionSource = "speaker_name_input";
+          let wasConflictPromptShown = false;
+          let wasVoiceMatchUsed = false;
+          const hasServerDetectedSpeaker = !!result.detectedSpeakerName?.trim();
+          const hasConfidentDetectedForConflict =
+            hasServerDetectedSpeaker &&
+            result.speakerConfidence !== null &&
+            result.speakerConfidence >= speakerAutoAssignMinConfidence;
+
+          if (hasConfidentDetectedForConflict && result.detectedSpeakerName) {
+            wasConflictPromptShown = true;
+            const confirmed = await resolveSpeakerNameConflict(
+              enrollName,
+              result,
+              speakerAutoAssignMinConfidence,
+            );
+            normalizedSpeakerName = confirmed || normalizedSpeakerName;
+            speakerAttributionSource =
+              normalizeSpeakerKey(confirmed) === normalizeSpeakerKey(result.detectedSpeakerName)
+                ? "voice_match"
+                : "speaker_conflict_prompt";
+            wasVoiceMatchUsed = speakerAttributionSource === "voice_match";
+          }
+
+          setTranscript(text);
+          setLastSpeakerName(normalizedSpeakerName);
+          const newHistoryEntry: TranscriptLogItem = {
+            id: historyClientId,
+            speakerName: normalizedSpeakerName,
+            text,
+            createdAt: createTimeLabel(createdAtMs),
+            createdAtMs,
+            speakerAttributionSource,
+            speakerNameInput: enrollName,
+            promptedSpeakerName: null,
+            detectedSpeakerName: result.detectedSpeakerName,
+            speakerConfidence: result.speakerConfidence,
+            matchedEnrollmentSampleId: result.detectedSpeakerSampleId,
+            matchedEnrollmentSampleSource: result.detectedSpeakerSampleSource,
+            matchedEnrollmentSampleCreatedAtIso: result.detectedSpeakerSampleCreatedAtIso,
+            assemblySpeakerLabel: result.assemblySpeakerLabel,
+            wasSpeakerNameInputProvided: true,
+            wasUnknownSpeakerPromptShown: false,
+            wasVoiceMatchUsed,
+            wasConflictPromptShown,
+            wasVoiceProfileEnrolled: !voiceEnrollmentRequestFailed,
+            ...(transcriptionDiagnosticsEnrollment
+              ? { transcriptionDiagnosticsEnrollment }
+              : {}),
+          };
+          setHistory((current) => [{ ...newHistoryEntry }, ...current]);
+          void saveHistoryEntryToCloud(newHistoryEntry);
+          void fetchSpeakers(true);
+          if (!voiceEnrollmentRequestFailed) {
+            setStatusText(
+              text
+                ? `Voice saved for ${normalizedSpeakerName}. Transcript ready.`
+                : `Voice saved for ${normalizedSpeakerName} — record again for speech text.`,
+            );
+          }
+          setIsUploading(false);
+          return;
+        }
+
         const createdAtMs = Date.now();
         const historyClientId = `${createdAtMs}`;
         const result = await transcribeAudio(uri, "", {
           historyClientId,
         });
+        let transcriptionDiagnosticsInitial: TranscriptionDiagnosticsPhase | undefined;
+        if (result.transcriptionDiagnostics) {
+          transcriptionDiagnosticsInitial = readDiagnosticsPhase({
+            ...result.transcriptionDiagnostics,
+            phase: "transcribe",
+          });
+        }
+        let transcriptionDiagnosticsEnrollment: TranscriptionDiagnosticsPhase | undefined;
         const text = result.text;
         const manualSpeakerName = "";
         const typedSpeakerName = "";
@@ -856,6 +1447,12 @@ export default function App() {
                 enrollmentSource: "unknown_speaker_prompt",
                 historyClientId,
               });
+              if (enrollmentResult.transcriptionDiagnostics) {
+                transcriptionDiagnosticsEnrollment = readDiagnosticsPhase({
+                  ...enrollmentResult.transcriptionDiagnostics,
+                  phase: "enrollment",
+                });
+              }
               shouldRefreshSpeakers = true;
               enrolledVoiceAsName = enrollmentResult.enrolledSpeakerName || trimmedEntered;
               normalizedSpeakerName = enrolledVoiceAsName;
@@ -875,6 +1472,7 @@ export default function App() {
 
         setTranscript(text);
         setLastSpeakerName(normalizedSpeakerName);
+        const pass1RecognitionEngine = firstPassEngineFromTranscriptionResult(result);
         const newHistoryEntry: TranscriptLogItem = {
           id: historyClientId,
           speakerName: normalizedSpeakerName,
@@ -895,8 +1493,10 @@ export default function App() {
           wasVoiceMatchUsed,
           wasConflictPromptShown,
           wasVoiceProfileEnrolled: !!enrolledVoiceAsName || (!!typedSpeakerName && !voiceEnrollmentRequestFailed),
+          ...(pass1RecognitionEngine ? { firstPassRecognitionEngine: pass1RecognitionEngine } : {}),
+          ...(transcriptionDiagnosticsInitial ? { transcriptionDiagnosticsInitial } : {}),
+          ...(transcriptionDiagnosticsEnrollment ? { transcriptionDiagnosticsEnrollment } : {}),
         };
-        const nextHistory = [newHistoryEntry, ...history];
         setHistory((current) => [
           {
             ...newHistoryEntry,
@@ -918,7 +1518,13 @@ export default function App() {
             setStatusText(text ? "Transcription complete." : "No speech detected.");
           }
         }
+        setIsUploading(false);
         return;
+      }
+
+      if (!opts?.fromEnrollModal) {
+        enrollTargetNameRef.current = null;
+        setEnrollTargetName(null);
       }
 
       const permission = await Audio.requestPermissionsAsync();
@@ -934,7 +1540,10 @@ export default function App() {
       });
 
       setTranscript("");
-      setStatusText("Listening...");
+      const recordingFor = enrollTargetNameRef.current;
+      setStatusText(
+        recordingFor ? `Recording voice sample for ${recordingFor}…` : "Listening…",
+      );
       const { recording: nextRecording } = await Audio.Recording.createAsync(
         Audio.RecordingOptionsPresets.HIGH_QUALITY,
       );
@@ -947,9 +1556,34 @@ export default function App() {
       setStatusText("Could not transcribe.");
       setErrorText(message);
       setRecording(null);
+      enrollTargetNameRef.current = null;
+      setEnrollTargetName(null);
     } finally {
       setIsUploading(false);
     }
+  };
+
+  const openEnrollSpeakerFlow = () => {
+    if (isUploading || isRecording) {
+      return;
+    }
+    setEnrollNameDraft("");
+    setEnrollSpeakerModalVisible(true);
+  };
+
+  const commitEnrollAndStartRecording = () => {
+    const name = enrollNameDraft.trim();
+    if (!name) {
+      return;
+    }
+    if (isUploading || isRecording) {
+      return;
+    }
+    setEnrollSpeakerModalVisible(false);
+    setEnrollNameDraft("");
+    enrollTargetNameRef.current = name;
+    setEnrollTargetName(name);
+    void handleRecordPress({ fromEnrollModal: true });
   };
 
   const latestHistoryItem = useMemo(() => {
@@ -1067,6 +1701,67 @@ export default function App() {
         </View>
       </Modal>
       <Modal
+        visible={enrollSpeakerModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setEnrollSpeakerModalVisible(false);
+          setEnrollNameDraft("");
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFillObject}
+            onPress={() => {
+              setEnrollSpeakerModalVisible(false);
+              setEnrollNameDraft("");
+            }}
+          />
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Enroll a speaker</Text>
+            <Text style={styles.modalSubtitle}>
+              Add a voice sample for someone already on your mind — no need to wait for a failed match. We’ll record a
+              clip, save their fingerprint (and embedding when available), and transcribe what they said.
+            </Text>
+            <TextInput
+              style={[styles.modalInput, styles.modalInputSingleLine]}
+              placeholder="Their name"
+              placeholderTextColor="#6b769e"
+              value={enrollNameDraft}
+              onChangeText={(text) => setEnrollNameDraft(text.slice(0, UNKNOWN_SPEAKER_NAME_MAX_CHARS))}
+              maxLength={UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+              autoCapitalize="words"
+              autoFocus
+            />
+            <Text style={styles.modalCharCount}>
+              {enrollNameDraft.length}/{UNKNOWN_SPEAKER_NAME_MAX_CHARS}
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable
+                style={[styles.modalButton, styles.modalButtonSecondary]}
+                onPress={() => {
+                  setEnrollSpeakerModalVisible(false);
+                  setEnrollNameDraft("");
+                }}
+              >
+                <Text style={styles.modalButtonSecondaryText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.modalButton,
+                  styles.modalButtonPrimary,
+                  !enrollNameDraft.trim() && styles.modalButtonDisabled,
+                ]}
+                disabled={!enrollNameDraft.trim()}
+                onPress={commitEnrollAndStartRecording}
+              >
+                <Text style={styles.modalButtonPrimaryText}>Record sample</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
         visible={unknownSpeakerModalVisible}
         transparent
         animationType="fade"
@@ -1117,8 +1812,8 @@ export default function App() {
         </View>
       </Modal>
       <View style={styles.card}>
-        <Text style={styles.kicker}>VOICE TO TEXT</Text>
-        <Text style={styles.title}>Speak. Capture. Review.</Text>
+        <Text style={styles.kicker}>VOICELINE</Text>
+        <Text style={styles.title}>Your voice, printed live.</Text>
         <Text style={styles.subtitle}>{statusText}</Text>
 
         <View style={styles.tabBar}>
@@ -1153,24 +1848,81 @@ export default function App() {
         {activeTab === "record" ? (
           <View style={styles.tabContent}>
             <Text style={styles.tabIntro}>
-              Start recording to auto-detect the speaker. If no enrolled voice matches, the app will ask who was speaking.
+              Tap the mic to transcribe with auto speaker ID — or the badge to add a new voice on purpose.
             </Text>
 
-            <Pressable
-              style={[styles.recordButton, isBusy && styles.recordButtonActive]}
-              onPress={handleRecordPress}
-            >
-              <Text style={styles.recordButtonText}>
-                {isUploading
-                  ? "Transcribing..."
-                  : isRecording
-                    ? "Stop Recording"
-                    : "Start Recording"}
-              </Text>
-            </Pressable>
+            {enrollTargetName ? (
+              <View style={styles.enrollChip}>
+                <Ionicons
+                  name={isRecording ? "ellipse" : "person"}
+                  size={14}
+                  color="#a8b9ff"
+                />
+                <Text style={styles.enrollChipText}>
+                  {isRecording ? `Recording sample for ${enrollTargetName}` : `Enroll: ${enrollTargetName}`}
+                </Text>
+              </View>
+            ) : null}
+
+            <View style={styles.recordHeroRow}>
+              <View style={styles.heroControlCol}>
+                <Pressable
+                  style={[styles.enrollOrb, isBusy && styles.controlDisabled]}
+                  disabled={isBusy}
+                  onPress={openEnrollSpeakerFlow}
+                  accessibilityRole="button"
+                  accessibilityLabel="Enroll speaker"
+                >
+                  <Ionicons name="person-add-sharp" size={26} color="#dbe2ff" />
+                </Pressable>
+              </View>
+
+              <Pressable
+                style={[
+                  styles.fabPrimary,
+                  isRecording && styles.fabRecording,
+                  isUploading && styles.fabUploading,
+                ]}
+                onPress={() => void handleRecordPress()}
+                disabled={isUploading}
+                accessibilityRole="button"
+                accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
+              >
+                {isUploading ? (
+                  <ActivityIndicator color="#fff" size="large" />
+                ) : (
+                  <Ionicons
+                    name={isRecording ? "stop" : "mic"}
+                    size={38}
+                    color={isRecording ? "#1a1528" : "#ffffff"}
+                  />
+                )}
+              </Pressable>
+
+              <View style={styles.heroControlCol} />
+            </View>
+            <Text style={styles.heroCaption}>
+              {isUploading
+                ? "Working…"
+                : isRecording
+                  ? "Tap the mic to stop"
+                  : "Tap the center to listen"}
+            </Text>
 
             <View style={styles.transcriptPanel}>
-              <Text style={styles.panelTitle}>Transcript</Text>
+              <View style={styles.transcriptPanelHeader}>
+                <Text style={styles.transcriptPanelTitle}>Transcript</Text>
+                <Pressable
+                  style={[
+                    styles.clearTranscriptButton,
+                    (!canShowTranscript || isBusy) && styles.clearTranscriptButtonDisabled,
+                  ]}
+                  disabled={!canShowTranscript || isBusy}
+                  onPress={clearTranscript}
+                >
+                  <Text style={styles.clearTranscriptButtonText}>Clear</Text>
+                </Pressable>
+              </View>
               <Text style={styles.speakerLabel}>Speaker: {lastSpeakerName}</Text>
               <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
                 <Text style={styles.transcriptText}>
@@ -1270,6 +2022,23 @@ export default function App() {
                                             {item.matchedEnrollmentSampleId ||
                                               (item.wasSpeakerNameInputProvided ? "User input" : "None")}
                                           </Text>
+                                          <Text style={styles.historySectionLabel}>Voice match</Text>
+                                          <Text style={styles.historyVoiceMatchDetail} selectable>
+                                            {formatHistoryVoiceMatchDetail(item)}
+                                          </Text>
+                                          <Text style={styles.historySectionLabel}>Logical path</Text>
+                                          <Text style={styles.historyLogicalFlow} selectable>
+                                            {formatHistoryLogicalFlow(item)}
+                                          </Text>
+                                          {item.transcriptionDiagnosticsInitial ||
+                                          item.transcriptionDiagnosticsEnrollment ? (
+                                            <>
+                                              <Text style={styles.historySectionLabel}>Server diagnostics</Text>
+                                              <Text style={styles.historyDiagnostics}>
+                                                {formatHistoryDiagnosticsText(item)}
+                                              </Text>
+                                            </>
+                                          ) : null}
                                           <Text style={styles.historyText}>{item.text || "(No speech detected)"}</Text>
                                         </View>
                                       ) : null}
@@ -1298,7 +2067,8 @@ export default function App() {
             <View style={styles.speakerListPanel}>
               <Text style={styles.panelTitle}>Known Speakers</Text>
               <Text style={styles.speakerListHelp}>
-                Use Show Records to view or delete voice samples. Edit Hint adds context for AssemblyAI.
+                Show Records lists each enrollment. Fingerprint = 12-D audio stats; embedding = ECAPA speaker
+                vector when saved.
               </Text>
               {isLoadingSpeakers ? (
                 <Text style={styles.historyEmptyText}>Loading speaker profiles...</Text>
@@ -1350,13 +2120,105 @@ export default function App() {
 
                       {sampleCount > 0 && isExpanded ? (
                         <View style={styles.sampleList}>
+                          <View style={styles.profileVectorsSection}>
+                            <Text style={styles.profileVectorsHeading}>Profile-level vectors</Text>
+                            <Text style={styles.profileVectorsHint}>
+                              Averaged values are rolled up from your saved samples on the server. Use for debugging,
+                              not for sharing (they identify a voice).
+                            </Text>
+                            <VectorBlock
+                              title={`Averaged fingerprint (${speaker.profileVoiceFingerprintDimensions ?? 12}-D roll-up)`}
+                              subtitle={
+                                speaker.profileVoiceFingerprintTruncated ? "Truncated in API response" : undefined
+                              }
+                              csv={formatVectorCsv(speaker.profileVoiceFingerprint)}
+                              emptyLabel="No aggregate fingerprint on profile."
+                              scrollMaxHeight={120}
+                            />
+                            {speaker.profileVoiceFingerprintsRecent?.length ? (
+                              <Text style={styles.recentVectorsLabel}>Recent roll-up fingerprints (last sessions)</Text>
+                            ) : null}
+                            {speaker.profileVoiceFingerprintsRecent?.map((row, idx) => (
+                              <VectorBlock
+                                key={`pfp-${speaker.name}-${idx}`}
+                                title={`Rolling fingerprint #${idx + 1} (${row.dimensions ?? row.values.length}-D)`}
+                                subtitle={row.truncated ? "Truncated in API response" : undefined}
+                                csv={formatVectorCsv(row.values)}
+                                emptyLabel=""
+                                scrollMaxHeight={96}
+                              />
+                            ))}
+                            {speaker.profileSpeakerEmbedding ? (
+                              <VectorBlock
+                                title={`Averaged speaker embedding (${speaker.profileSpeakerEmbedding.dimensions ?? speaker.profileSpeakerEmbedding.values.length}-D, neural)`}
+                                subtitle={
+                                  speaker.profileSpeakerEmbedding.truncated
+                                    ? `Showing first ${speaker.profileSpeakerEmbedding.values.length} values; full vector is longer.`
+                                    : undefined
+                                }
+                                csv={formatVectorCsv(speaker.profileSpeakerEmbedding.values)}
+                                emptyLabel="No aggregate embedding."
+                                scrollMaxHeight={168}
+                              />
+                            ) : (
+                              <Text style={styles.vectorBlockEmpty}>No aggregate speaker embedding on profile yet.</Text>
+                            )}
+                            {speaker.profileSpeakerEmbeddingsRecent?.length ? (
+                              <Text style={styles.recentVectorsLabel}>Recent embedding snapshots</Text>
+                            ) : null}
+                            {speaker.profileSpeakerEmbeddingsRecent?.map((row, idx) => (
+                              <VectorBlock
+                                key={`pem-${speaker.name}-${idx}`}
+                                title={`Embedding snapshot #${idx + 1} (${row.dimensions ?? row.values.length}-D)`}
+                                subtitle={
+                                  row.truncated
+                                    ? `Showing first ${row.values.length} values; full vector is longer.`
+                                    : undefined
+                                }
+                                csv={formatVectorCsv(row.values)}
+                                emptyLabel=""
+                                scrollMaxHeight={140}
+                              />
+                            ))}
+                          </View>
+
                           {speaker.enrollmentSamples?.map((sample) => (
                             <View key={sample.sampleId} style={styles.sampleRow}>
                               <View style={styles.sampleRowMain}>
                                 <Text style={styles.sampleTitle}>{formatSampleTime(sample)}</Text>
                                 <Text style={styles.sampleMeta}>
-                                  {formatSampleSource(sample.source)} • {sample.sampleId.slice(0, 8)}
+                                  {formatSampleSource(sample.source)} • sample {sample.sampleId.slice(0, 8)}…
                                 </Text>
+                                <VectorBlock
+                                  title={`Fingerprint (${sample.voiceFingerprintDimensions ?? 12}-D audio stats)`}
+                                  subtitle={
+                                    sample.voiceFingerprintTruncated ? "Truncated in API response" : undefined
+                                  }
+                                  csv={formatVectorCsv(sample.voiceFingerprint)}
+                                  emptyLabel={
+                                    sample.hasFingerprint === false
+                                      ? "No fingerprint stored for this sample."
+                                      : "No fingerprint returned (older server data?)."
+                                  }
+                                  scrollMaxHeight={88}
+                                />
+                                <VectorBlock
+                                  title={`Speaker embedding (${sample.embeddingDimensions ?? "?"}-D, neural)`}
+                                  subtitle={
+                                    sample.embeddingTruncated
+                                      ? `Showing first ${sample.embeddingVector?.length ?? 0} values; full vector is longer.`
+                                      : !sample.embeddingVector?.length && sample.hasEmbedding
+                                        ? "Embedding exists but was not returned (refresh after app update)."
+                                        : undefined
+                                  }
+                                  csv={formatVectorCsv(sample.embeddingVector)}
+                                  emptyLabel={
+                                    sample.hasEmbedding === false
+                                      ? "No embedding stored for this sample (record with embedding service healthy + named save)."
+                                      : "No embedding returned."
+                                  }
+                                  scrollMaxHeight={112}
+                                />
                               </View>
                               <Pressable
                                 style={styles.sampleDeleteButton}
@@ -1383,38 +2245,43 @@ export default function App() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: "#0b1020",
+    backgroundColor: "#070b16",
     justifyContent: "flex-start",
     paddingHorizontal: 20,
     paddingVertical: 20,
   },
   card: {
     borderRadius: 24,
-    backgroundColor: "#141b34",
-    padding: 20,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.22,
-    shadowRadius: 20,
-    elevation: 8,
+    backgroundColor: "#12182e",
+    padding: 22,
+    borderWidth: 1,
+    borderColor: "rgba(110, 132, 255, 0.22)",
+    shadowColor: "#3d4fd9",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.35,
+    shadowRadius: 28,
+    elevation: 12,
   },
   kicker: {
-    color: "#8ea1ff",
-    fontSize: 12,
-    fontWeight: "700",
-    letterSpacing: 1.4,
-    marginBottom: 8,
+    color: "#9eb2ff",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 2.2,
+    marginBottom: 10,
   },
   title: {
-    color: "#f5f7ff",
-    fontSize: 26,
-    fontWeight: "700",
+    color: "#f8f9ff",
+    fontSize: 28,
+    fontWeight: "800",
+    letterSpacing: -0.5,
+    lineHeight: 34,
   },
   subtitle: {
-    color: "#b9c1dd",
-    marginTop: 8,
-    marginBottom: 14,
+    color: "#98a8d4",
+    marginTop: 10,
+    marginBottom: 16,
     fontSize: 14,
+    lineHeight: 20,
   },
   tabBar: {
     flexDirection: "row",
@@ -1434,7 +2301,12 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   tabButtonActive: {
-    backgroundColor: "#6a7cff",
+    backgroundColor: "#5f6fff",
+    shadowColor: "#5f6fff",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    elevation: 4,
   },
   tabButtonText: {
     color: "#9ba8d8",
@@ -1455,10 +2327,11 @@ const styles = StyleSheet.create({
     paddingBottom: 18,
   },
   tabIntro: {
-    color: "#9aaad8",
+    color: "#8898cc",
     fontSize: 12,
-    lineHeight: 17,
-    marginBottom: 10,
+    lineHeight: 18,
+    marginBottom: 14,
+    textAlign: "center",
   },
   tabPanel: {
     marginTop: 2,
@@ -1482,20 +2355,84 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
   },
-  recordButton: {
-    backgroundColor: "#6a7cff",
-    borderRadius: 14,
+  recordHeroRow: {
+    flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 14,
-    marginBottom: 10,
+    marginTop: 8,
+    marginBottom: 6,
   },
-  recordButtonActive: {
-    backgroundColor: "#ff6b7d",
+  heroControlCol: {
+    width: 68,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  recordButtonText: {
-    color: "#ffffff",
-    fontSize: 16,
+  enrollOrb: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: "rgba(42, 58, 120, 0.85)",
+    borderWidth: 1,
+    borderColor: "rgba(124, 148, 255, 0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#4d62ff",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  fabPrimary: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: "#5f6fff",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+    shadowColor: "#6f7cff",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.55,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  fabRecording: {
+    backgroundColor: "#ff5c7a",
+    borderColor: "rgba(255,255,255,0.25)",
+    shadowColor: "#ff3d6a",
+  },
+  fabUploading: {
+    backgroundColor: "#4a5588",
+    opacity: 0.9,
+  },
+  controlDisabled: {
+    opacity: 0.45,
+  },
+  heroCaption: {
+    textAlign: "center",
+    color: "#7a88ba",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 8,
+    letterSpacing: 0.2,
+  },
+  enrollChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "center",
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "rgba(80, 102, 200, 0.2)",
+    borderWidth: 1,
+    borderColor: "rgba(120, 142, 255, 0.35)",
+    marginBottom: 12,
+  },
+  enrollChipText: {
+    color: "#c3ceff",
+    fontSize: 12,
     fontWeight: "700",
   },
   historyToggleButton: {
@@ -1525,6 +2462,34 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#202c55",
     minHeight: 220,
+  },
+  transcriptPanelHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginHorizontal: 14,
+    marginTop: 14,
+  },
+  transcriptPanelTitle: {
+    color: "#aeb8df",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  clearTranscriptButton: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#5a6bb5",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: "#1a2548",
+  },
+  clearTranscriptButtonDisabled: {
+    opacity: 0.4,
+  },
+  clearTranscriptButtonText: {
+    color: "#c9d4ff",
+    fontSize: 12,
+    fontWeight: "600",
   },
   panelTitle: {
     color: "#aeb8df",
@@ -1662,6 +2627,53 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     marginBottom: 4,
   },
+  historySectionLabel: {
+    color: "#aebfff",
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  historyVoiceMatchDetail: {
+    color: "#e2eaff",
+    fontSize: 11,
+    lineHeight: 17,
+    marginBottom: 4,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#0f1628",
+    borderRadius: 8,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#2a5080",
+  },
+  historyLogicalFlow: {
+    color: "#c5d5ff",
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 8,
+    marginBottom: 6,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#12182e",
+    borderRadius: 8,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#2c3a6e",
+  },
+  historyDiagnostics: {
+    color: "#b8ccff",
+    fontSize: 10,
+    lineHeight: 14,
+    marginTop: 6,
+    marginBottom: 8,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    backgroundColor: "#0a0f22",
+    borderRadius: 8,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: "#202c55",
+  },
   deleteLogButton: {
     borderRadius: 8,
     borderWidth: 1,
@@ -1752,9 +2764,61 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     gap: 8,
   },
+  profileVectorsSection: {
+    marginBottom: 4,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#253264",
+  },
+  profileVectorsHeading: {
+    color: "#e8ecff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  profileVectorsHint: {
+    color: "#7580ab",
+    fontSize: 10,
+    marginTop: 4,
+    marginBottom: 6,
+    lineHeight: 14,
+  },
+  recentVectorsLabel: {
+    color: "#8ea1df",
+    fontSize: 11,
+    fontWeight: "600",
+    marginTop: 10,
+  },
+  vectorBlock: {
+    marginTop: 8,
+  },
+  vectorBlockTitle: {
+    color: "#8ea1ff",
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  vectorBlockSubtitle: {
+    color: "#c9a227",
+    fontSize: 10,
+    marginTop: 2,
+  },
+  vectorBlockEmpty: {
+    color: "#5c6a8e",
+    fontSize: 10,
+    fontStyle: "italic",
+    marginTop: 4,
+  },
+  vectorScroll: {
+    marginTop: 4,
+  },
+  vectorMono: {
+    color: "#dce4ff",
+    fontSize: 9,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    lineHeight: 13,
+  },
   sampleRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
     gap: 10,
   },
