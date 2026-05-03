@@ -35,7 +35,19 @@ const hasUsableAiPayload = (ai) =>
     (Array.isArray(ai.actionItems) && ai.actionItems.some((item) => typeof item === "string" && item.trim())) ||
     (Array.isArray(ai.topics) && ai.topics.some((item) => typeof item === "string" && item.trim())) ||
     (Array.isArray(ai.followUpQuestions) &&
-      ai.followUpQuestions.some((item) => typeof item === "string" && item.trim())));
+      ai.followUpQuestions.some((item) => typeof item === "string" && item.trim())) ||
+    (Array.isArray(ai.actions) &&
+      ai.actions.some(
+        (a) =>
+          a &&
+          typeof a === "object" &&
+          typeof a.label === "string" &&
+          a.label.trim() &&
+          typeof a.fallback === "string",
+      )) ||
+    (ai.calendarIntent &&
+      typeof ai.calendarIntent === "object" &&
+      ai.calendarIntent.action === "create_event"));
 const assemblySpeechModels = ["universal-3-pro", "universal-2"];
 const forcedLanguageCode = process.env.ASSEMBLYAI_FORCE_LANGUAGE_CODE || "";
 const languageFallbackCodes = (process.env.ASSEMBLYAI_LANGUAGE_FALLBACKS || "hi,te,bn")
@@ -501,6 +513,67 @@ const fetchDrivingDurationWithTraffic = async (originLat, originLng, destination
   };
 };
 
+const normalizeCalendarIntentFromModel = (raw) => {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const action = raw.action === "create_event" ? "create_event" : "none";
+  const p = raw.parameters && typeof raw.parameters === "object" ? raw.parameters : {};
+  const strOrEmpty = (v) => (typeof v === "string" ? v.trim() : "");
+  const nullableIso = (v) => {
+    if (v === null || v === undefined) {
+      return null;
+    }
+    if (typeof v === "string") {
+      const t = v.trim();
+      return t.length ? t : null;
+    }
+    return null;
+  };
+  const participants = Array.isArray(p.participants)
+    ? p.participants.filter((x) => typeof x === "string").map((s) => s.trim()).filter(Boolean).slice(0, 50)
+    : [];
+  const parameters = {
+    title: strOrEmpty(p.title).slice(0, 500),
+    location: strOrEmpty(p.location).slice(0, 500),
+    start_time: nullableIso(p.start_time),
+    end_time: nullableIso(p.end_time),
+    notes: p.notes !== undefined && p.notes !== null ? strOrEmpty(p.notes).slice(0, 2000) : "",
+    participants,
+  };
+  let confidence = Number(raw.confidence);
+  if (!Number.isFinite(confidence)) {
+    confidence = 0;
+  }
+  confidence = Math.min(1, Math.max(0, confidence));
+  const fb = raw.fallback && typeof raw.fallback === "object" ? raw.fallback : {};
+  const fbTypeRaw = typeof fb.type === "string" ? fb.type.trim().slice(0, 48) : "";
+  const fbType = fbTypeRaw || "none";
+  const fbMessage = typeof fb.message === "string" ? fb.message.trim().slice(0, 500) : "";
+  const fallback = {
+    type: fbType,
+    message: fbMessage,
+  };
+  if (action !== "create_event") {
+    return undefined;
+  }
+  const hasSignal =
+    parameters.title.length > 0 ||
+    parameters.start_time ||
+    parameters.location.length > 0 ||
+    parameters.notes.length > 0 ||
+    parameters.participants.length > 0;
+  if (!hasSignal) {
+    return undefined;
+  }
+  return {
+    action: "create_event",
+    parameters,
+    confidence,
+    fallback,
+  };
+};
+
 const buildAiInsights = async (text) => {
   if (!openaiApiKey || !text.trim()) {
     return null;
@@ -518,7 +591,7 @@ const buildAiInsights = async (text) => {
           {
             role: "system",
             content:
-              "You summarize voice transcripts into concise notes. Return strict JSON with keys summary, actionItems, topics, and followUpQuestions. summary: one short paragraph — mirror what the user wanted (including named places, dishes, or goals). If they ask YOU for factual details you cannot know (restaurant or business address, phone, hours, menu), never invent them. Say clearly they asked for that info and give a practical next step in ordinary language (e.g. search the business name in maps or call them). Do not imply the user failed to provide something they were requesting from the assistant. actionItems: concrete steps (short strings), e.g. Look up [business name] address in Google Maps. topics: 3-8 Title Case tags. followUpQuestions: 0-3 spoken questions ONLY to fill gaps in what the user is trying to plan or record about themselves — e.g. appointment time if they said they are booking but gave no time, or which person if ambiguous. NEVER use followUpQuestions to ask the user for an address, phone number, hours, or other facts they explicitly asked you to find or tell them. If the main point is them wanting location or contact info for a place, followUpQuestions must be []. If transcript is enough, use []. Empty transcript/noise: empty summary, empty arrays.",
+              "You summarize voice transcripts into concise notes. Return strict JSON with keys summary, actionItems, topics, followUpQuestions, actions, and calendarIntent. summary: one short paragraph — mirror what the user wanted (including named places, dishes, or goals). If they ask YOU for factual details you cannot know (restaurant or business address, phone, hours, menu), never invent them. Say clearly they asked for that info and give a practical next step in ordinary language (e.g. search the business name in maps or call them). Do not imply the user failed to provide something they were requesting from the assistant. actionItems: concrete steps (short strings), e.g. Look up [business name] address in Google Maps. topics: 3-8 Title Case tags. followUpQuestions: 0-3 spoken questions ONLY to fill gaps in what the user is trying to plan or record about themselves — e.g. appointment time if they said they are booking but gave no time, or which person if ambiguous. NEVER use followUpQuestions to ask the user for an address, phone number, hours, or other facts they explicitly asked you to find or tell them. If the main point is them wanting location or contact info for a place, followUpQuestions must be []. If transcript is enough, use []. actions: 0–24 objects for automatable next steps. Each object: type (GENERIC | CALL_CONTACT | CREATE_TASK | ADD_SUBTASK | CHECK_CALENDAR), label (short imperative; align with actionItems when both list the same steps), detail (optional facts from transcript: who, task title, time hints; use empty string if none), confidence (number 0–1, your estimate that type+label match the speaker’s intent), fallback (always set: what the app should do if confidence is low or execution is risky—e.g. show contact picker, ask which task, open calendar read-only; if confidence is high, a brief confirm step is fine). Use GENERIC when no specific automation fits. Prefer the same count and order as actionItems when they enumerate the same steps. calendarIntent: follows the create_event tool shape. When the speaker clearly plans one calendar event (visit, appointment, meeting) with enough detail, set action to \"create_event\". parameters MUST always include title, location, start_time (ISO 8601 when you can infer date and time from the transcript; empty string only if truly unknown). Optional: end_time as ISO string or JSON null if not specified; optional notes and participants array (omit or use \"\" / [] if none). confidence 0–1. fallback: object with string type and string message (e.g. type \"none\" and message \"\" when no extra fallback). If there is NO calendar event, set action to \"none\", parameters with title/location/start_time as empty strings, omit end_time or use null, notes \"\", participants [], confidence 0, fallback { type: \"none\", message: \"\" }. Empty transcript/noise: empty summary, empty arrays, calendarIntent with action none.",
           },
           {
             role: "user",
@@ -537,8 +610,62 @@ const buildAiInsights = async (text) => {
                 actionItems: { type: "array", items: { type: "string" } },
                 topics: { type: "array", items: { type: "string" } },
                 followUpQuestions: { type: "array", items: { type: "string" } },
+                actions: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      type: {
+                        type: "string",
+                        enum: ["GENERIC", "CALL_CONTACT", "CREATE_TASK", "ADD_SUBTASK", "CHECK_CALENDAR"],
+                      },
+                      label: { type: "string" },
+                      detail: { type: "string" },
+                      confidence: { type: "number", minimum: 0, maximum: 1 },
+                      fallback: { type: "string" },
+                    },
+                    required: ["type", "label", "detail", "confidence", "fallback"],
+                  },
+                },
+                calendarIntent: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    action: { type: "string" },
+                    parameters: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        title: { type: "string" },
+                        location: { type: "string" },
+                        start_time: { type: "string" },
+                        end_time: {
+                          anyOf: [{ type: "string" }, { type: "null" }],
+                        },
+                        notes: { type: "string" },
+                        participants: {
+                          type: "array",
+                          items: { type: "string" },
+                        },
+                      },
+                      required: ["title", "location", "start_time"],
+                    },
+                    confidence: { type: "number" },
+                    fallback: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        type: { type: "string" },
+                        message: { type: "string" },
+                      },
+                      required: ["type", "message"],
+                    },
+                  },
+                  required: ["action", "parameters", "confidence", "fallback"],
+                },
               },
-              required: ["summary", "actionItems", "topics", "followUpQuestions"],
+              required: ["summary", "actionItems", "topics", "followUpQuestions", "actions", "calendarIntent"],
             },
           },
         },
@@ -548,7 +675,42 @@ const buildAiInsights = async (text) => {
 
   const raw = response.output_text || "{}";
   const parsed = JSON.parse(raw);
-  return {
+  const allowedActionTypes = new Set([
+    "GENERIC",
+    "CALL_CONTACT",
+    "CREATE_TASK",
+    "ADD_SUBTASK",
+    "CHECK_CALENDAR",
+  ]);
+  const actions = Array.isArray(parsed.actions)
+    ? parsed.actions
+        .filter((row) => row && typeof row === "object")
+        .map((row) => {
+          const t = typeof row.type === "string" ? row.type.trim().toUpperCase() : "";
+          const type = allowedActionTypes.has(t) ? t : "GENERIC";
+          const label = typeof row.label === "string" ? row.label.trim() : "";
+          const detail = typeof row.detail === "string" ? row.detail.trim() : "";
+          const fallback = typeof row.fallback === "string" ? row.fallback.trim() : "";
+          let confidence = Number(row.confidence);
+          if (!Number.isFinite(confidence)) {
+            confidence = 0;
+          }
+          confidence = Math.min(1, Math.max(0, confidence));
+          if (!label) {
+            return null;
+          }
+          return {
+            type,
+            label,
+            ...(detail ? { detail } : {}),
+            confidence,
+            fallback: fallback || "Show this suggestion for manual follow-up.",
+          };
+        })
+        .filter(Boolean)
+    : [];
+  const calendarIntent = normalizeCalendarIntentFromModel(parsed.calendarIntent);
+  const out = {
     summary: typeof parsed.summary === "string" ? parsed.summary : "",
     actionItems: Array.isArray(parsed.actionItems)
       ? parsed.actionItems.filter((item) => typeof item === "string")
@@ -557,7 +719,10 @@ const buildAiInsights = async (text) => {
     followUpQuestions: Array.isArray(parsed.followUpQuestions)
       ? parsed.followUpQuestions.filter((item) => typeof item === "string")
       : [],
+    ...(actions.length > 0 ? { actions } : {}),
+    ...(calendarIntent ? { calendarIntent } : {}),
   };
+  return out;
 };
 
 const buildSpeakerCorrectionSuggestion = async (latestText, recentHistory) => {
@@ -1394,7 +1559,19 @@ app.post("/history", async (req, res) => {
         (Array.isArray(clientAi.topics) &&
           clientAi.topics.some((item) => typeof item === "string" && item.trim())) ||
         (Array.isArray(clientAi.followUpQuestions) &&
-          clientAi.followUpQuestions.some((item) => typeof item === "string" && item.trim())));
+          clientAi.followUpQuestions.some((item) => typeof item === "string" && item.trim())) ||
+        (Array.isArray(clientAi.actions) &&
+          clientAi.actions.some(
+            (a) =>
+              a &&
+              typeof a === "object" &&
+              typeof a.label === "string" &&
+              a.label.trim() &&
+              typeof a.fallback === "string",
+          )) ||
+        (clientAi.calendarIntent &&
+          typeof clientAi.calendarIntent === "object" &&
+          clientAi.calendarIntent.action === "create_event"));
     if (!hasUsableClientAi && text && openaiApiKey) {
       try {
         const generated = await buildAiInsights(text);

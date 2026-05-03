@@ -56,12 +56,47 @@ type TranscriptionDiagnosticsPhase = TranscriptionDiagnosticsPayload & {
   phase: "transcribe" | "enrollment";
 };
 
+/** Typed next step from the model (for future automation); use confidence + fallback for safe UX. */
+type TranscriptStructuredAction = {
+  type: "GENERIC" | "CALL_CONTACT" | "CREATE_TASK" | "ADD_SUBTASK" | "CHECK_CALENDAR";
+  label: string;
+  detail?: string;
+  confidence: number;
+  fallback: string;
+};
+
+type CalendarIntentFallback = {
+  type: string;
+  message: string;
+};
+
+type CalendarEventParameters = {
+  title: string;
+  location: string;
+  start_time: string | null;
+  end_time: string | null;
+  notes: string;
+  participants: string[];
+};
+
+/** Single calendar event intent from the model (matches API `calendarIntent`). */
+type TranscriptCalendarIntent = {
+  action: "create_event";
+  parameters: CalendarEventParameters;
+  confidence: number;
+  fallback: CalendarIntentFallback;
+};
+
 type TranscriptAiInsights = {
   summary: string;
   actionItems: string[];
   topics: string[];
   /** Short questions the app may read aloud so the user can answer by voice (e.g. missing address). */
   followUpQuestions?: string[];
+  /** Structured actions with confidence and fallback hints (from API when model supports them). */
+  actions?: TranscriptStructuredAction[];
+  /** When the transcript implies one concrete calendar event (e.g. visit at a time and place). */
+  calendarIntent?: TranscriptCalendarIntent;
 };
 
 type TranscriptLogItem = {
@@ -264,6 +299,19 @@ const collectPhonesFromHistoryItem = (item: TranscriptLogItem): Array<{ display:
   }
   if (item.ai?.actionItems?.length) {
     parts.push(item.ai.actionItems.join("\n"));
+  }
+  if (item.ai?.actions?.length) {
+    for (const a of item.ai.actions) {
+      parts.push([a.label, a.detail, a.fallback].filter(Boolean).join("\n"));
+    }
+  }
+  if (item.ai?.calendarIntent) {
+    const ci = item.ai.calendarIntent;
+    parts.push(
+      [ci.parameters.title, ci.parameters.location, ci.parameters.notes, ci.parameters.participants.join(", ")].join(
+        "\n",
+      ),
+    );
   }
   if (item.ai?.followUpQuestions?.length) {
     parts.push(item.ai.followUpQuestions.join("\n"));
@@ -781,6 +829,68 @@ const pickFirstFollowUpQuestion = (ai: TranscriptAiInsights | null | undefined) 
   return q || null;
 };
 
+const parseTranscriptCalendarIntent = (raw: unknown): TranscriptCalendarIntent | undefined => {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const o = raw as Record<string, unknown>;
+  if (o.action !== "create_event") {
+    return undefined;
+  }
+  const p = o.parameters && typeof o.parameters === "object" ? (o.parameters as Record<string, unknown>) : {};
+  const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const nullableTime = (v: unknown): string | null => {
+    if (v === null || v === undefined) {
+      return null;
+    }
+    if (typeof v === "string") {
+      const t = v.trim();
+      return t.length ? t : null;
+    }
+    return null;
+  };
+  const participants = Array.isArray(p.participants)
+    ? p.participants
+        .filter((item): item is string => typeof item === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 50)
+    : [];
+  const notes =
+    p.notes !== undefined && p.notes !== null && typeof p.notes === "string" ? p.notes.trim() : "";
+  const parameters: CalendarEventParameters = {
+    title: str(p.title),
+    location: str(p.location),
+    start_time: nullableTime(p.start_time),
+    end_time: nullableTime(p.end_time),
+    notes,
+    participants,
+  };
+  const fbRaw = o.fallback && typeof o.fallback === "object" ? (o.fallback as Record<string, unknown>) : {};
+  const fbType = typeof fbRaw.type === "string" ? fbRaw.type.trim().slice(0, 48) : "none";
+  const message = typeof fbRaw.message === "string" ? fbRaw.message.trim() : "";
+  let confidence = Number(o.confidence);
+  if (!Number.isFinite(confidence)) {
+    confidence = 0;
+  }
+  confidence = Math.min(1, Math.max(0, confidence));
+  const hasSignal =
+    parameters.title.length > 0 ||
+    !!parameters.start_time ||
+    parameters.location.length > 0 ||
+    parameters.notes.length > 0 ||
+    parameters.participants.length > 0;
+  if (!hasSignal) {
+    return undefined;
+  }
+  return {
+    action: "create_event",
+    parameters,
+    confidence,
+    fallback: { type: fbType || "none", message },
+  };
+};
+
 const parseTranscriptAi = (raw: unknown): TranscriptAiInsights | undefined => {
   if (!raw || typeof raw !== "object") {
     return undefined;
@@ -805,7 +915,61 @@ const parseTranscriptAi = (raw: unknown): TranscriptAiInsights | undefined => {
         .map((s) => s.trim())
         .filter(Boolean)
     : [];
-  if (!summary && actionItems.length === 0 && topics.length === 0 && followUpQuestions.length === 0) {
+  const allowedActionTypes = new Set<TranscriptStructuredAction["type"]>([
+    "GENERIC",
+    "CALL_CONTACT",
+    "CREATE_TASK",
+    "ADD_SUBTASK",
+    "CHECK_CALENDAR",
+  ]);
+  const actions: TranscriptStructuredAction[] | undefined = (() => {
+    if (!Array.isArray(o.actions)) {
+      return undefined;
+    }
+    const rows = o.actions
+      .filter((row): row is Record<string, unknown> => !!row && typeof row === "object")
+      .map((row) => {
+        const rawType =
+          typeof row.type === "string" ? row.type.trim().toUpperCase() : "";
+        const type = allowedActionTypes.has(rawType as TranscriptStructuredAction["type"])
+          ? (rawType as TranscriptStructuredAction["type"])
+          : "GENERIC";
+        const label = typeof row.label === "string" ? row.label.trim() : "";
+        const detailRaw = typeof row.detail === "string" ? row.detail.trim() : "";
+        const fallbackRaw = typeof row.fallback === "string" ? row.fallback.trim() : "";
+        let confidence = Number(row.confidence);
+        if (!Number.isFinite(confidence)) {
+          confidence = 0;
+        }
+        confidence = Math.min(1, Math.max(0, confidence));
+        if (!label) {
+          return null;
+        }
+        const fallback =
+          fallbackRaw || "Show this suggestion for manual follow-up.";
+        const out: TranscriptStructuredAction = {
+          type,
+          label,
+          confidence,
+          fallback,
+        };
+        if (detailRaw) {
+          out.detail = detailRaw;
+        }
+        return out;
+      })
+      .filter((x): x is TranscriptStructuredAction => x !== null);
+    return rows.length > 0 ? rows : undefined;
+  })();
+  const calendarIntent = parseTranscriptCalendarIntent(o.calendarIntent);
+  if (
+    !summary &&
+    actionItems.length === 0 &&
+    topics.length === 0 &&
+    followUpQuestions.length === 0 &&
+    !actions?.length &&
+    !calendarIntent
+  ) {
     return undefined;
   }
   return {
@@ -813,8 +977,25 @@ const parseTranscriptAi = (raw: unknown): TranscriptAiInsights | undefined => {
     actionItems,
     topics,
     ...(followUpQuestions.length > 0 ? { followUpQuestions } : {}),
+    ...(actions?.length ? { actions } : {}),
+    ...(calendarIntent ? { calendarIntent } : {}),
   };
 };
+
+/** Stable key order for reviewing the same structured object the API parses from the model. */
+const formatHistoryAiModelOutputJson = (ai: TranscriptAiInsights) =>
+  JSON.stringify(
+    {
+      calendarIntent: ai.calendarIntent ?? null,
+      actions: ai.actions ?? [],
+      actionItems: ai.actionItems ?? [],
+      topics: ai.topics ?? [],
+      followUpQuestions: ai.followUpQuestions ?? [],
+      summary: ai.summary ?? "",
+    },
+    null,
+    2,
+  );
 
 const transcriptHasAiPayload = (item: TranscriptLogItem) => {
   const ai = item.ai;
@@ -825,7 +1006,9 @@ const transcriptHasAiPayload = (item: TranscriptLogItem) => {
     !!ai.summary.trim() ||
     (ai.actionItems?.length ?? 0) > 0 ||
     (ai.topics?.length ?? 0) > 0 ||
-    (ai.followUpQuestions?.length ?? 0) > 0
+    (ai.followUpQuestions?.length ?? 0) > 0 ||
+    (ai.actions?.length ?? 0) > 0 ||
+    !!ai.calendarIntent
   );
 };
 
@@ -3467,7 +3650,7 @@ export default function App() {
                                                 }}
                                                 disabled={historyAiRegeneratingId === item.id || !item.text?.trim()}
                                                 accessibilityRole="button"
-                                                accessibilityLabel="Refresh AI summary for this entry"
+                                                accessibilityLabel="Refresh AI insights for this entry"
                                               >
                                                 <Text style={styles.refreshAiButtonText}>
                                                   {historyAiRegeneratingId === item.id ? "AI…" : "Refresh AI"}
@@ -3508,13 +3691,14 @@ export default function App() {
                                           {item.ai &&
                                           (item.ai.summary ||
                                             (item.ai.actionItems?.length ?? 0) > 0 ||
+                                            (item.ai.actions?.length ?? 0) > 0 ||
+                                            item.ai.calendarIntent ||
                                             (item.ai.topics?.length ?? 0) > 0 ||
                                             (item.ai.followUpQuestions?.length ?? 0) > 0) ? (
                                             <View style={styles.historyAiBlock}>
-                                              <Text style={styles.historySectionLabel}>AI summary</Text>
-                                              {item.ai.summary ? (
-                                                <Text style={styles.historyAiSummary}>{item.ai.summary}</Text>
-                                              ) : null}
+                                              <Text style={[styles.historySectionLabel, styles.historyAiBlockTitle]}>
+                                                AI insights
+                                              </Text>
                                               {(item.ai.actionItems?.length ?? 0) > 0 ? (
                                                 <>
                                                   <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
@@ -3525,6 +3709,41 @@ export default function App() {
                                                       • {line}
                                                     </Text>
                                                   ))}
+                                                </>
+                                              ) : null}
+                                              {(item.ai.actions?.length ?? 0) > 0 ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Action + confidence + fallback
+                                                  </Text>
+                                                  {(item.ai.actions ?? []).map((act, idx) => (
+                                                    <View key={`ai-act-struct-${item.id}-${idx}`} style={styles.historyStructuredAction}>
+                                                      <Text style={styles.historyStructuredActionLine} selectable>
+                                                        {act.type.replace(/_/g, " ")} · {act.label} · {Math.round(
+                                                          act.confidence * 100,
+                                                        )}
+                                                        % confident
+                                                      </Text>
+                                                      {act.detail ? (
+                                                        <Text style={styles.historyStructuredActionDetail} selectable>
+                                                          Detail: {act.detail}
+                                                        </Text>
+                                                      ) : null}
+                                                      <Text style={styles.historyStructuredActionFallback} selectable>
+                                                        Fallback: {act.fallback}
+                                                      </Text>
+                                                    </View>
+                                                  ))}
+                                                </>
+                                              ) : null}
+                                              {item.ai.calendarIntent ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Calendar · create_event
+                                                  </Text>
+                                                  <Text style={styles.historyAiJson} selectable>
+                                                    {JSON.stringify(item.ai.calendarIntent, null, 2)}
+                                                  </Text>
                                                 </>
                                               ) : null}
                                               {(item.ai.topics?.length ?? 0) > 0 ? (
@@ -3577,6 +3796,20 @@ export default function App() {
                                                   ))}
                                                 </>
                                               ) : null}
+                                              {item.ai.summary?.trim() ? (
+                                                <>
+                                                  <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                    Summary
+                                                  </Text>
+                                                  <Text style={styles.historyAiSummarySecondary}>{item.ai.summary}</Text>
+                                                </>
+                                              ) : null}
+                                              <Text style={[styles.historySectionLabel, styles.historyAiSubLabel]}>
+                                                Model output (JSON)
+                                              </Text>
+                                              <Text style={styles.historyAiJson} selectable>
+                                                {formatHistoryAiModelOutputJson(item.ai)}
+                                              </Text>
                                             </View>
                                           ) : null}
                                           {item.answeredVoiceFollowUp ? (
@@ -3955,7 +4188,9 @@ export default function App() {
                   <Text style={styles.aiHelpBullet}>
                     • The server needs OPENAI_API_KEY so new recordings can store an AI block with the transcript.
                   </Text>
-                  <Text style={styles.aiHelpBullet}>• In History, expand an entry — you should see an “AI summary” block when present.</Text>
+                  <Text style={styles.aiHelpBullet}>
+                    • In History, expand an entry — AI insights show action items first, then structured JSON from the model.
+                  </Text>
                 </View>
               ) : null}
             </View>
@@ -5223,11 +5458,22 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(100, 116, 139, 0.25)",
   },
-  historyAiSummary: {
-    color: "#0f172a",
-    fontSize: 14,
-    lineHeight: 21,
-    marginBottom: 6,
+  historyAiBlockTitle: {
+    marginTop: 0,
+  },
+  historyAiSummarySecondary: {
+    color: "#64748b",
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  historyAiJson: {
+    color: "#334155",
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 2,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
   historyAiSubLabel: {
     marginTop: 10,
@@ -5238,6 +5484,31 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     marginLeft: 4,
     marginBottom: 2,
+  },
+  historyStructuredAction: {
+    marginBottom: 10,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(148, 163, 184, 0.35)",
+  },
+  historyStructuredActionLine: {
+    color: "#0f172a",
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "700",
+  },
+  historyStructuredActionDetail: {
+    color: "#475569",
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 4,
+  },
+  historyStructuredActionFallback: {
+    color: "#64748b",
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 4,
+    fontStyle: "italic",
   },
   historyAiTopicsLine: {
     color: "#475569",

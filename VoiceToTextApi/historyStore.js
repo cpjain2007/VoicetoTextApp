@@ -106,6 +106,119 @@ const cleanStringList = (value, maxItems, itemMaxLen) => {
     .filter((item) => item.length > 0);
 };
 
+const STRUCTURED_ACTION_TYPES = new Set([
+  "GENERIC",
+  "CALL_CONTACT",
+  "CREATE_TASK",
+  "ADD_SUBTASK",
+  "CHECK_CALENDAR",
+]);
+
+const cleanStructuredActionList = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, 24)
+    .map((row) => {
+      if (!row || typeof row !== "object") {
+        return null;
+      }
+      const rawType = cleanString(row.type, 48).toUpperCase();
+      const type = STRUCTURED_ACTION_TYPES.has(rawType) ? rawType : "GENERIC";
+      const label = cleanString(row.label, 400);
+      const detail = cleanString(row.detail, 400);
+      const fallbackRaw = cleanString(row.fallback, 500);
+      let c = Number(row.confidence);
+      if (!Number.isFinite(c)) {
+        c = 0;
+      }
+      const confidence = Math.min(1, Math.max(0, c));
+      if (!label.length) {
+        return null;
+      }
+      const fallback =
+        fallbackRaw || "Show this suggestion for manual follow-up.";
+      const out = {
+        type,
+        label,
+        confidence,
+        fallback,
+      };
+      if (detail.length) {
+        out.detail = detail;
+      }
+      return out;
+    })
+    .filter(Boolean);
+};
+
+const cleanNullableTime = (v) => {
+  if (v === null || v === undefined) {
+    return null;
+  }
+  if (typeof v === "string") {
+    const t = v.trim().slice(0, 80);
+    return t.length ? t : null;
+  }
+  return null;
+};
+
+const cleanCalendarIntent = (value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  if (value.action !== "create_event") {
+    return null;
+  }
+  const p = value.parameters && typeof value.parameters === "object" ? value.parameters : {};
+  const title = cleanString(p.title, 500);
+  const location = cleanString(p.location, 500);
+  const start_time = cleanNullableTime(p.start_time);
+  const end_time = cleanNullableTime(p.end_time);
+  const notes = p.notes !== undefined && p.notes !== null ? cleanString(p.notes, 2000) : "";
+  const participants = Array.isArray(p.participants)
+    ? p.participants
+        .slice(0, 50)
+        .map((x) => cleanString(x, 120))
+        .filter((s) => s.length > 0)
+    : [];
+  const fb = value.fallback && typeof value.fallback === "object" ? value.fallback : {};
+  const fallbackType = cleanString(fb.type, 48) || "none";
+  const message = cleanString(fb.message, 500);
+  let c = Number(value.confidence);
+  if (!Number.isFinite(c)) {
+    c = 0;
+  }
+  const confidence = Math.min(1, Math.max(0, c));
+  const parameters = {
+    title,
+    location,
+    start_time,
+    end_time,
+    notes,
+    participants,
+  };
+  const hasSignal =
+    title.length > 0 ||
+    start_time ||
+    location.length > 0 ||
+    notes.length > 0 ||
+    participants.length > 0;
+  if (!hasSignal) {
+    return null;
+  }
+  return {
+    action: "create_event",
+    parameters,
+    confidence,
+    fallback: {
+      type: fallbackType,
+      message,
+    },
+  };
+};
+
 /** Normalized AI payload persisted on each history entry (from transcribe or POST /history). */
 const cleanAiInsights = (value) => {
   if (!value || typeof value !== "object") {
@@ -115,7 +228,16 @@ const cleanAiInsights = (value) => {
   const actionItems = cleanStringList(value.actionItems, 24, 400);
   const topics = cleanStringList(value.topics, 16, 64);
   const followUpQuestions = cleanStringList(value.followUpQuestions, 5, 280);
-  if (!summary && actionItems.length === 0 && topics.length === 0 && followUpQuestions.length === 0) {
+  const actions = cleanStructuredActionList(value.actions);
+  const calendarIntent = cleanCalendarIntent(value.calendarIntent);
+  if (
+    !summary &&
+    actionItems.length === 0 &&
+    topics.length === 0 &&
+    followUpQuestions.length === 0 &&
+    actions.length === 0 &&
+    !calendarIntent
+  ) {
     return null;
   }
   return {
@@ -123,6 +245,8 @@ const cleanAiInsights = (value) => {
     actionItems,
     topics,
     ...(followUpQuestions.length > 0 ? { followUpQuestions } : {}),
+    ...(actions.length > 0 ? { actions } : {}),
+    ...(calendarIntent ? { calendarIntent } : {}),
   };
 };
 
